@@ -9,8 +9,8 @@ requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "hive-protocol"
-description = "The definitive protocol for Python in computational biology"
+name = "mutation_call_variability"
+description = "Investigating mutation call performance as a function of cell count"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -18,11 +18,12 @@ authors = [
     { name = "CBG-ETH Zurich", email = "cbg@ethz.ch" },
 ]
 keywords = [
-    "bayesian-inference",
-    "kalman-filter",
-    "computational-biology",
-    "pymc",
-    "state-space-models",
+    "single-cell-sequencing",
+    "single-cell-dna-sequencing",
+    "variant-calling",
+    "clonal-evolution",
+    "cancer-genomics",
+    "tapestri",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -30,9 +31,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Typing :: Typed",
 ]
@@ -43,10 +41,10 @@ dynamic = ["version"]
 # Core dependencies - minimal for library use
 dependencies = [
     "numpy>=1.24",
-    "scipy>=1.10",
-    "pymc>=5.0",
-    "arviz>=0.15",
     "polars>=0.20",
+    "pandas>=2.0",
+    "loompy>=3.0.6",
+    "pyyaml>=6.0",
     "pydantic>=2.0",
 ]
 
@@ -73,7 +71,7 @@ workflow = [
 ]
 # All optional dependencies
 all = [
-    "hive-protocol[dev,docs,workflow]",
+    "mutation_call_variability[dev,docs,workflow]",
 ]
 
 [project.urls]
@@ -96,7 +94,7 @@ local_scheme = "no-local-version"
 
 [tool.hatch.build.hooks.vcs]
 # Generate version file during build
-version-file = "src/hive_protocol/_version_generated.py"
+version-file = "src/mutation_call_variability/_version_generated.py"
 
 [tool.hatch.build.targets.sdist]
 # Include only source code in source distributions
@@ -107,7 +105,7 @@ include = [
 
 [tool.hatch.build.targets.wheel]
 # Package only the src directory
-packages = ["src/hive_protocol"]
+packages = ["src/mutation_call_variability"]
 
 # =============================================================================
 # Ruff - Fast Python linter and formatter (replaces black, flake8, isort)
@@ -150,7 +148,7 @@ ignore = [
 
 [tool.ruff.lint.isort]
 # Group imports: standard library, third-party, local
-known-first-party = ["hive_protocol"]
+known-first-party = ["mutation_call_variability"]
 
 [tool.ruff.format]
 # Use double quotes (like Black)
@@ -176,10 +174,8 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 # Ignore missing stubs for scientific libraries
 module = [
-    "pymc.*",
-    "arviz.*",
     "polars.*",
-    "scipy.*",
+    "loompy.*",
     "hypothesis.*",
 ]
 ignore_missing_imports = true
@@ -213,7 +209,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 # Coverage settings
-source = ["src/hive_protocol"]
+source = ["src/mutation_call_variability"]
 branch = true
 omit = [
     "*/_version*.py",

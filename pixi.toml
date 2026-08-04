@@ -6,85 +6,104 @@
 #
 # Quick start:
 #   pixi install          # Create environment and install dependencies
+#   pixi install -e docs  # Add Quarto/plotting stack (only needed to render docs/notebooks)
 #   pixi run test         # Run tests
 #   pixi run lint         # Check code style
 #   pixi shell            # Activate environment
 
 [workspace]
-name = "hive-protocol"
+name = "mutation_call_variability"
 version = "0.1.0"
-description = "The definitive protocol for Python in computational biology"
+description = "Investigating mutation call performance as a function of cell count"
 authors = ["CBG-ETH Zurich <cbg@ethz.ch>"]
 channels = ["conda-forge"]
-platforms = ["linux-64", "osx-64", "osx-arm64"]
+platforms = ["linux-64"]#, "osx-64", "osx-arm64"]
 
 # =============================================================================
-# Dependencies
+# Default dependencies - runtime + everyday dev tooling + Snakemake workflow.
+# Kept intentionally lean: this is what `pixi install` resolves and builds by
+# default, so only the docs/notebook stack (Quarto/Jupyter/plotting) is opted
+# out into the `docs` feature below.
 # =============================================================================
 
 [dependencies]
-# Python version
-python = ">=3.10,<3.13"
+python = "==3.12.0"
 
-# Scientific computing core (from conda-forge for optimized builds)
+# Runtime - actually imported by src/mutation_call_variability
 numpy = ">=1.24"
-scipy = ">=1.10"
-
-# Bayesian inference
-pymc = ">=5.0"
-arviz = ">=0.15"
-
-# Data manipulation
 polars = ">=0.20"
-
-# Data validation
+pandas = ">=2.0"
+loompy = ">=3.0.6"
+pyyaml = ">=6.0"
 pydantic = ">=2.0"
 
-# Visualization
-matplotlib = ">=3.7"
-seaborn = ">=0.12"
-
-# Development tools (available on conda-forge)
+# Dev tools (lightweight, pure-Python - negligible resolve cost)
 pytest = ">=7.0"
 pytest-cov = ">=4.0"
 hypothesis = ">=6.0"
 ruff = ">=0.8.0"
 pre-commit = ">=3.0"
-
-# Documentation
-quarto = ">=1.4"
-ipykernel = ">=6.0"    # Required for Quarto to find Python kernel
-jupyter = ">=1.0"
-pyyaml = ">=6.0"       # Required by Quarto's jupyter integration
-
-# Type checking
 mypy = ">=1.0"      # Used in CI/pre-commit for stability
 pyright = ">=1.1"   # Used locally for fast feedback
-
-# =============================================================================
-# PyPI-only dependencies
-# =============================================================================
+memray = ">=1.19.3,<2"
+quarto = ">=1.4"
+ipykernel = ">=6.0"    # Required for Quarto to find a Python kernel
+nbclient = ">=0.5"     # Required by quarto's jupyter engine to execute notebooks
+matplotlib = ">=3.7"
+seaborn = ">=0.12"
 
 [pypi-dependencies]
 # Install the package itself in editable mode
-hive-protocol = { path = ".", editable = true }
+mutation_call_variability = { path = ".", editable = true }
+
+# Docstring coverage checker (lightweight)
+interrogate = ">=1.5"
 
 # Snakemake from PyPI (more reliable cross-platform than conda)
 snakemake = ">=8.0"
 
-# Docstring coverage checker
-interrogate = ">=1.5"
+# SLURM executor plugin, so `pixi run workflow` can submit rules as SLURM jobs
+snakemake-executor-plugin-slurm = ">=2.0"
+
+# Pinned below 0.6.1: that release strips SLURM_MEM_* env vars before the
+# nested srun call (meant to fix a GPU-only conflict), which silently drops
+# the job's real memory allocation and falls back to the cluster's tiny
+# default-mem-per-cpu for every job, GPU or not.
+# https://github.com/snakemake/snakemake-executor-plugin-slurm-jobstep
+snakemake-executor-plugin-slurm-jobstep = "<0.6.1"
+
+# =============================================================================
+# Optional features - only resolved/installed when explicitly requested via
+# `pixi install -e <name>` or `pixi run -e <name> <task>`.
+# =============================================================================
+
+
+
+# # Render presentation slides
+# slides = "quarto render docs/slides.qmd"
+
+# # Publish documentation to GitHub Pages
+# docs-publish = "quarto publish gh-pages docs/ --no-prompt"
+
+# [environments]
+# docs = ["docs"]
 
 # =============================================================================
 # Tasks - Custom commands accessible via `pixi run <task>`
 # =============================================================================
 
 [tasks]
+# Register Jupyter kernel for Quarto
+kernel = "python -m ipykernel install --user --name python3 --display-name 'Python 3 (mutation_call_variability)'"
+
+# Render Quarto notebooks
+docs = { cmd = "quarto render notebooks/*", depends-on = ["kernel"] }
+
 # Run tests
 test = "pytest tests/ -v"
 
 # Run tests with coverage
-test-cov = "pytest tests/ --cov=src/hive_protocol --cov-report=term-missing"
+test-cov = "pytest tests/ --cov=src/mutation_call_variability --cov-report=term-missing"
 
 # Run linter
 lint = "ruff check src/ tests/"
@@ -115,43 +134,24 @@ hooks = "pre-commit install"
 # Run pre-commit on all files
 hooks-all = "pre-commit run --all-files"
 
-# Register Jupyter kernel for Quarto
-kernel = "python -m ipykernel install --user --name python3 --display-name 'Python 3 (hive-protocol)'"
-
-# Render Quarto notebooks and copy to docs/tutorials
-docs = { cmd = "quarto render notebooks/ && rm -rf docs/tutorials && mv notebooks/_site docs/tutorials", depends-on = ["kernel"] }
-
-# Render presentation slides
-slides = "quarto render docs/slides.qmd"
-
-# Publish documentation to GitHub Pages
-docs-publish = "quarto publish gh-pages docs/ --no-prompt"
-
 # Run Snakemake workflow (dry run)
-workflow-dry = "snakemake -n --snakefile workflow/Snakefile"
+workflow-dry = "snakemake -n --profile workflow/profiles --snakefile workflow/Snakefile"
 
-# Run Snakemake workflow
-workflow = "snakemake --cores 4 --snakefile workflow/Snakefile"
+# Run Snakemake workflow, submitting rules as SLURM jobs
+workflow = "snakemake --executor slurm --jobs 300 --profile workflow/profiles --printshellcmds --snakefile workflow/Snakefile" # --config workflow/config/params.yaml
+
 
 # Clean generated files
 clean = "rm -rf results/*.parquet docs/*.html .pytest_cache .mypy_cache .ruff_cache"
 
 # =============================================================================
-# Activation
-# =============================================================================
-
-[activation.env]
-# Ensure reproducible PyMC behavior
-PYTENSOR_FLAGS = "device=cpu,floatX=float64"
-
-# =============================================================================
 # Platform-specific configuration
 # =============================================================================
 
-[target.osx-arm64.dependencies]
-# ARM Mac specific - use accelerate for faster linear algebra
-libblas = { version = "*", build = "*accelerate" }
+# [target.osx-arm64.dependencies]
+# # ARM Mac specific - use accelerate for faster linear algebra
+# libblas = { version = "*", build = "*accelerate" }
 
-[target.linux-64.dependencies]
-# Linux specific - use OpenBLAS
-libblas = { version = "*", build = "*openblas" }
+# [target.linux-64.dependencies]
+# # Linux specific - use OpenBLAS
+# libblas = { version = "*", build = "*openblas" }

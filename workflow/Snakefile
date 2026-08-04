@@ -1,7 +1,7 @@
-"""Snakemake workflow for Kalman filter parameter sweep experiments.
+'''Snakemake workflow to analyse SNP call as a function of cell count.
 
-This workflow demonstrates how to run systematic experiments across
-a parameter grid and aggregate results into a reproducible report.
+This workflow generated subsampled datasets and calls variants on them, in order to correlate cell count with variant calling performance.
+The goal is to show that variability in SNP calling is driven by the cell count, and no biases are introduced by the subsampling procedure.
 
 Usage:
     # Run all experiments
@@ -15,24 +15,35 @@ Usage:
 
     # Run specific experiment
     snakemake results/exp_proc0.1_meas0.5.parquet
-"""
+'''
 
 import itertools
 from pathlib import Path
 
+from mutation_call_variability import commodity
+
 # Load configuration
-configfile: "workflow/config/params.yaml"
+configfile: 'workflow/config/params.yaml'
 
 # Extract parameter grid
-PROCESS_NOISE = config["parameter_grid"]["process_noise"]
-MEASUREMENT_NOISE = config["parameter_grid"]["measurement_noise"]
+all_files = commodity.load_lookup_table(config['lookup_table'])
+IN_DIR = Path(config['input_directory'])
+OUT_DIR = output_directory = Path(config['output_directory'])
+all_files.append([OUT_DIR / 'S1.full.filtered_variants.csv', OUT_DIR / 'S2.full.filtered_variants.csv', OUT_DIR / 'S3.full.filtered_variants.csv'])
+all_files.append(OUT_DIR / 'jaccard_indices.tsv')
 
-# Generate all experiment combinations
-EXPERIMENTS = [
-    f"proc{p}_meas{m}"
-    for p, m in itertools.product(PROCESS_NOISE, MEASUREMENT_NOISE)
-]
+# =============================================================================
+# Define functions to condition inputs and parameters on wildcards
+# =============================================================================
 
+def get_loom_file(wildcards):
+    paper2datasetPID = {'S1': 'GFB-4397_GFB-4401', 'S2': 'GFB-4395_GFB-4399', 'S3': 'GFB-4396_GFB-4400'}
+    datasetPID = paper2datasetPID.get(wildcards.samplePID)
+    return IN_DIR / f'{datasetPID}_out' / 'dna' / 'results' / f'{datasetPID}.cells.loom'
+
+
+def get_mem_mb(wildcards, attempt):
+    return  50000 * 2**(attempt-1)  # double memory for each retry
 
 # =============================================================================
 # Target rule: what we want to build
@@ -41,164 +52,125 @@ EXPERIMENTS = [
 rule all:
     """Build all outputs: experiment results and final report."""
     input:
-        expand("results/exp_{exp}.parquet", exp=EXPERIMENTS),
-        "results/summary.parquet",
-        "docs/results.html",
+        all_files,
 
 
 # =============================================================================
 # Experiment rules
 # =============================================================================
 
-rule run_experiment:
-    """Run a single Kalman filter experiment with specified parameters."""
+rule subsample_loom:
+    '''Based on the lookup table, subsample the loom files to the desired cell counts.'''
+    input:
+        get_loom_file
     output:
-        "results/exp_{experiment}.parquet",
-    params:
-        n_steps=config["simulation"]["n_steps"],
-        seed=config["simulation"]["seed"],
-        n_samples=config["inference"]["n_samples"],
-        n_tune=config["inference"]["n_tune"],
+        OUT_DIR
+        / '{samplePID}.{cell_count}.{hash}.loom'
     resources:
-        # MCMC is memory-intensive
-        mem_mb=2000,
+        mem_mb_per_cpu = get_mem_mb,
+        mem_mb = 5000,
+        runtime = 240,
+    threads: 1
     run:
-        # Parse experiment name to get parameters
-        # Format: proc{process_noise}_meas{measurement_noise}
-        parts = wildcards.experiment.split("_")
-        process_noise = float(parts[0].replace("proc", ""))
-        measurement_noise = float(parts[1].replace("meas", ""))
-
-        # Run the experiment
-        import polars as pl
-        from hive_protocol.data import simulate_noisy_trajectory
-        from hive_protocol.inference import (
-            fit_kalman_filter,
-            extract_filtered_states,
-            check_convergence,
-            compute_prediction_errors,
-            summarize_filter_performance,
-        )
-
-        # Simulate data
-        true_states, observations = simulate_noisy_trajectory(
-            n_steps=params.n_steps,
-            process_noise=process_noise,
-            measurement_noise=measurement_noise,
-            seed=params.seed,
-        )
-
-        # Fit model
-        _, trace = fit_kalman_filter(
-            observations,
-            n_samples=params.n_samples,
-            n_tune=params.n_tune,
-            random_seed=params.seed,
-        )
-
-        # Extract results
-        filtered = extract_filtered_states(trace)
-        convergence = check_convergence(trace)
-        errors_df = compute_prediction_errors(true_states, filtered)
-        performance = summarize_filter_performance(errors_df)
-
-        # Create results DataFrame
-        results = pl.DataFrame({
-            "experiment": [wildcards.experiment],
-            "process_noise": [process_noise],
-            "measurement_noise": [measurement_noise],
-            "n_steps": [params.n_steps],
-            "rmse": [performance["rmse"]],
-            "mae": [performance["mae"]],
-            "bias": [performance["bias"]],
-            "coverage": [performance["coverage"]],
-            "max_error": [performance["max_error"]],
-            "rhat_max": [convergence["rhat_max"]],
-            "ess_min": [convergence["ess_min"]],
-            "n_divergences": [convergence["n_divergences"]],
-            "converged": [convergence["converged"]],
-        })
-
-        # Save to Parquet (efficient columnar format)
-        results.write_parquet(output[0])
-        print(f"Saved results to {output[0]}")
+        from mutation_call_variability import subsample_loom
+        subsample_loom.subsample_loom(input[0], output[0])
 
 
-rule aggregate_results:
-    """Combine all experiment results into a single summary file."""
+rule mosaic_subsample:
     input:
-        expand("results/exp_{exp}.parquet", exp=EXPERIMENTS),
+        loom = OUT_DIR
+        / '{samplePID}.{cell_count}.{hash}.loom'
     output:
-        "results/summary.parquet",
-    run:
-        import polars as pl
-
-        # Read and concatenate all results
-        dfs = [pl.read_parquet(f) for f in input]
-        summary = pl.concat(dfs)
-
-        # Sort for readability
-        summary = summary.sort(["process_noise", "measurement_noise"])
-
-        # Save combined results
-        summary.write_parquet(output[0])
-        print(f"Aggregated {len(input)} experiments into {output[0]}")
-
-
-rule render_report:
-    """Render the diagnostics notebook with experiment results."""
-    input:
-        summary="results/summary.parquet",
-        notebook="notebooks/03_diagnostics.qmd",
-    output:
-        "docs/results.html",
-    run:
-        import subprocess
-        import sys
-        import os
-        import shutil
-        from pathlib import Path
-
-        # Get absolute paths
-        workdir = Path(workflow.basedir).parent  # repo root
-        notebook_path = workdir / input.notebook
-        notebook_dir = notebook_path.parent
-
-        # Ensure quarto uses the correct Python from pixi environment
-        env = os.environ.copy()
-        env["QUARTO_PYTHON"] = sys.executable
-
-        # Render to notebook directory
-        subprocess.run([
-            "quarto", "render", str(notebook_path),
-            "--to", "html",
-            "--output", "results.html"
-        ], check=True, env=env)
-
-        # Move output to docs/
-        src = notebook_dir / "results.html"
-        dst = workdir / "docs" / "results.html"
-        shutil.move(str(src), str(dst))
-
-
-# =============================================================================
-# Utility rules
-# =============================================================================
-
-rule clean:
-    """Remove all generated files."""
+        var = OUT_DIR / '{samplePID}.{cell_count}.{hash}.filtered_variants.csv',
+        gt = OUT_DIR / '{samplePID}.{cell_count}.{hash}.filtered_variants_gt.csv',
+    # conda: os.path.join(ENV_DIR, 'analysis.yaml')
+    threads: 1
+    resources:
+        mem_mb_per_cpu = get_mem_mb,
+        runtime = 60,
+    params:
+        minGQ = config.get('mosaic', {}).get('minGQ', 30),
+        minDP = config.get('mosaic', {}).get('minDP', 10),
+        minVAF = config.get('mosaic', {}).get('minVAF', 0.2),
+        minVarGeno = config.get('mosaic', {}).get('minVarGeno', 0.5),
+        minCellGeno = config.get('mosaic', {}).get('minCellGeno', 0.5),
+        minMutated = config.get('mosaic', {}).get('minMutated', 50),
+        maxRefVAF = config.get('mosaic', {}).get('maxRefVAF', 0.05),
+        minHomVAF = config.get('mosaic', {}).get('minHomVAF', 0.95),
+        minHetVAF = config.get('mosaic', {}).get('minHetVAF', 0.35),
+        proximity = config.get('mosaic', {}).get('proximity', '25 50 100 200')
     shell:
-        """
-        rm -rf results/*.parquet
-        rm -rf docs/*.html
-        rm -rf .snakemake
-        """
+        '''
+        python src/mutation_call_variability/mosaic_processing.py \
+            -i {input.loom} \
+            -o {output.var} \
+            --minGQ {params.minGQ} \
+            --minDP {params.minDP} \
+            --minVAF {params.minVAF} \
+            --minVarGeno {params.minVarGeno} \
+            --minCellGeno {params.minCellGeno} \
+            --minMutated {params.minMutated} \
+            --max_ref_VAF {params.maxRefVAF} \
+            --min_hom_VAF {params.minHomVAF} \
+            --min_het_VAF {params.minHetVAF} \
+            --proximity {params.proximity}
+        '''
 
 
-rule list_experiments:
-    """Print all experiment configurations."""
+rule mosaic_full:
+    input:
+        loom = get_loom_file,
+    output:
+        var = OUT_DIR / '{samplePID}.full.filtered_variants.csv',
+        gt = OUT_DIR / '{samplePID}.full.filtered_variants_gt.csv',
+    threads: 1
+    resources:
+        mem_mb_per_cpu = 49152,
+        runtime = 60,
+    params:
+        minGQ = config.get('mosaic', {}).get('minGQ', 30),
+        minDP = config.get('mosaic', {}).get('minDP', 10),
+        minVAF = config.get('mosaic', {}).get('minVAF', 0.2),
+        minVarGeno = config.get('mosaic', {}).get('minVarGeno', 0.5),
+        minCellGeno = config.get('mosaic', {}).get('minCellGeno', 0.5),
+        minMutated = config.get('mosaic', {}).get('minMutated', 50),
+        maxRefVAF = config.get('mosaic', {}).get('maxRefVAF', 0.05),
+        minHomVAF = config.get('mosaic', {}).get('minHomVAF', 0.95),
+        minHetVAF = config.get('mosaic', {}).get('minHetVAF', 0.35),
+        proximity = config.get('mosaic', {}).get('proximity', '25 50 100 200')
+    shell:
+        '''
+        python src/mutation_call_variability/mosaic_processing.py \
+            -i {input.loom} \
+            -o {output.var} \
+            --minGQ {params.minGQ} \
+            --minDP {params.minDP} \
+            --minVAF {params.minVAF} \
+            --minVarGeno {params.minVarGeno} \
+            --minCellGeno {params.minCellGeno} \
+            --minMutated {params.minMutated} \
+            --max_ref_VAF {params.maxRefVAF} \
+            --min_hom_VAF {params.minHomVAF} \
+            --min_het_VAF {params.minHetVAF} \
+            --proximity {params.proximity}
+        '''
+
+rule compute_jaccard_indices:
+    input:
+        lookup_table = config['lookup_table'],
+        full_variant_sets = [
+            OUT_DIR / 'S1.full.filtered_variants.csv',
+            OUT_DIR / 'S2.full.filtered_variants.csv',
+            OUT_DIR / 'S3.full.filtered_variants.csv']
+    output:
+        OUT_DIR / 'jaccard_indices.tsv'
+    resources:
+        mem_mb_per_cpu = 5000,
+        runtime = 60,
+    threads: 1
     run:
-        print(f"Total experiments: {len(EXPERIMENTS)}")
-        print("\nExperiment configurations:")
-        for exp in EXPERIMENTS:
-            print(f"  - {exp}")
+        from mutation_call_variability import jaccard_index
+        full_variant_sets_assignment = {'S1': input.full_variant_sets[0], 'S2': input.full_variant_sets[1], 'S3': input.full_variant_sets[2]}
+
+        output_table = jaccard_index.compute_jaccard_indices(input.lookup_table, full_variant_sets_assignment)
+        output_table.write_csv(output[0],separator='\t', include_header=True)

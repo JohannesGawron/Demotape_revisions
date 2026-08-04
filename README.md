@@ -1,216 +1,156 @@
+# mutation_call_variability
+
+Investigating how mutation calls vary in single-cell DNA sequencing data as a
+function of cell count.
+
+## Background
+
+This project addresses concerns raised in the revisions of **DemoTape**, regarding
+the claim that clonal structures and evolutionary patterns inferred from
+multiplexed data closely match those from individually sequenced samples.
+
+The reviewers noted noticeable discrepancies in SNP detection between
+demultiplexed and individually sequenced samples, which could indicate
+misidentified mutations that in turn might affect downstream clonal inference.
+While some of these differences are attributable to filtering thresholds, the
+analysis here tests the alternative explanation: that the discrepancies are
+driven simply by **cell count**, and do not introduce systematic biases in
+genotype reconstruction.
+
+The approach is to repeatedly subsample cells from the full datasets, re-run
+variant calling on each subsample, and measure the concordance between the
+variants called on the subsample and those called on the full dataset
+(Jaccard index). If the discrepancies are a cell-count effect, concordance should
+depend on the number of cells and nothing else.
+
+Input data are MissionBio Tapestri single-cell DNA panel datasets in `.loom`
+format. Three samples are analysed, named as in the DemoTape paper:
+
+| Paper ID | Dataset PID         |
+| -------- | ------------------- |
+| `S1`     | `GFB-4397_GFB-4401` |
+| `S2`     | `GFB-4395_GFB-4399` |
+| `S3`     | `GFB-4396_GFB-4400` |
+
+## Repository layout
+
 ```
-═══════════════════════════════════════════════════════════════════════════════
+src/mutation_call_variability/
+├── create_lookup_table.py   # Draw random subsample sizes -> lookup table (TSV)
+├── subsample_loom.py        # Subsample cells from a loom file into a new loom file
+├── mosaic_processing.py     # MissionBio-mosaic-equivalent variant filtering (CLI)
+├── jaccard_index.py         # Jaccard index between two variant call sets
+└── commodity.py             # Shared helpers (lookup table I/O, filename parsing)
 
-  ⬢ HIVE-PROTOCOL ⬢  RESEARCH SOFTWARE CONTAINMENT STANDARD
+workflow/
+├── Snakefile                # Pipeline definition
+├── config/params.yaml       # Input/output paths, mosaic filtering thresholds
+├── config/subsample_lookup_table.tsv  # Generated: one row per subsample
+└── profiles/config.yaml     # SLURM executor profile (account, retries, defaults)
 
-═══════════════════════════════════════════════════════════════════════════════
+notebooks/
+└── regression.qmd           # Statistical analysis of the preprocessed data
 ```
 
-**THE DEFINITIVE PROTOCOL FOR PYTHON IN COMPUTATIONAL BIOLOGY**
+## Setup
 
-`PROTOCOL-001` | `v1.0.0`
-
-[![CI](https://github.com/cbg-ethz/hive-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/cbg-ethz/hive-protocol/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Pixi](https://img.shields.io/badge/pixi-managed-yellow.svg)](https://pixi.sh/)
-[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-
-</div>
-
----
-
-```
-⚠ WARNING: Unstructured research code detected
-→ SOLUTION: Deploy HIVE-PROTOCOL
-```
-
----
-
-## PROTOCOL OBJECTIVE
-
-Transform research scripts into production-grade software.
-
-```
-PROTOCOL COMPONENTS:
-[✓] Dependency Management    [✓] Code Quality
-[✓] Testing Framework        [✓] CI/CD Pipeline
-[✓] Type Safety              [✓] Documentation
-[✓] Configuration            [✓] Reproducibility
-```
-
----
-
-## DEPLOYMENT SEQUENCE
+Dependencies are managed with [pixi](https://pixi.sh/). The workspace defines a
+single `default` environment and targets `linux-64` only (it is meant to run on
+the ETH Euler cluster).
 
 ```bash
-# 1. CLONE
-git clone https://github.com/cbg-ethz/hive-protocol.git
-cd hive-protocol
-
-# 2. INSTALL PIXI (if not present)
-curl -fsSL https://pixi.sh/install.sh | bash
-
-# 3. INITIALIZE ENVIRONMENT
 pixi install
-
-# 4. VERIFY DEPLOYMENT
-pixi run test
 ```
 
-**STATUS:** Environment operational.
+### Cluster-specific configuration
 
----
-
-## TECHNOLOGY MATRIX
-
-| Category | Old Protocol | Modern Protocol | Improvement |
-|----------|--------------|-----------------|-------------|
-| **Package Management** | pip + requirements.txt | **pixi** | 10-100x faster |
-| **Code Quality** | Black + flake8 + isort | **Ruff** | 30-100x faster |
-| **Data Processing** | pandas | **Polars** | 5-50x faster |
-| **Notebooks** | Jupyter | **Quarto** | Git-friendly |
-| **Testing** | unittest | **pytest + Hypothesis** | Property-based |
-| **Configuration** | argparse / dict | **Pydantic** | Auto-validation |
-| **Type Checking** | None | **mypy + Pyright** | Static analysis |
-
----
-
-## DIRECTORY STRUCTURE
-
-```
-hive-protocol/
-├── src/hive_protocol/       # SOURCE CODE (src layout)
-│   ├── inference/           # Kalman filter + diagnostics
-│   └── data/                # Data simulation
-├── tests/                   # PYTEST + HYPOTHESIS
-├── notebooks/               # QUARTO TUTORIALS
-│   ├── 01_introduction.qmd
-│   ├── 02_kalman_filter.qmd
-│   └── 03_diagnostics.qmd
-├── workflow/                # SNAKEMAKE PIPELINE
-│   ├── Snakefile
-│   └── config/params.yaml
-├── docs/                    # WORKSHOP MATERIALS
-├── pyproject.toml           # SINGLE SOURCE OF TRUTH
-├── pixi.toml                # ENVIRONMENT SPEC
-└── .pre-commit-config.yaml  # QUALITY HOOKS
-```
-
----
-
-## OPERATIONS MANUAL
+**Point pixi's cache at scratch.** With `PIXI_CACHE_DIR` on `/cluster/project`,
+`pixi install` can hang until the uv lock times out (300 s), and even plain
+`pixi run` invocations become erratically slow (observed 0.4 s vs. 37 s for the
+same no-op command). Add this to your shell profile on the cluster:
 
 ```bash
-# TESTING
-pixi run test              # Run test suite
-pixi run test-cov          # Run with coverage report
-
-# CODE QUALITY
-pixi run lint              # Check code style
-pixi run lint-fix          # Auto-fix issues
-pixi run format            # Format code
-
-# TYPE CHECKING
-pixi run typecheck         # Pyright (fast, local)
-pixi run typecheck-ci      # mypy (stable, CI)
-
-# DOCUMENTATION
-pixi run docs              # Render notebooks
-pixi run slides            # Render presentation
-
-# WORKFLOW
-pixi run workflow          # Execute Snakemake pipeline
-pixi run workflow-dry      # Dry run (preview)
-
-# MAINTENANCE
-pixi run check             # Run ALL quality checks
-pixi run hooks             # Install pre-commit hooks
+export PIXI_CACHE_DIR=/scratch/$USER-pixi-cache
 ```
 
----
+**`snakemake-executor-plugin-slurm-jobstep` is pinned to `<0.6.1`.** Version
+0.6.1 strips `SLURM_MEM_*` environment variables before launching the nested
+`srun` step (intended to fix a GPU-only conflict, but applied unconditionally).
+The nested step then cannot inherit the job's memory allocation and falls back to
+the cluster's default mem-per-cpu, so jobs are OOM-killed at ~1 GB regardless of
+what `mem_mb_per_cpu` requests. Do not lift this pin without re-testing;
+`repro_oom_bug/` contains a minimal reproduction.
 
-## PROTOCOL ADAPTATION
+## Running the analysis
 
-### STEPS
+### 1. Generate the subsample lookup table
 
-1. **FORK** this repository
-2. **RENAME** `hive_protocol` → `your_project`
-3. **UPDATE** `pyproject.toml` metadata
-4. **REPLACE** Kalman filter with your domain logic
-5. **RETAIN** testing + CI patterns
-
-### PRESERVE
-
-```
-[✓] src/ layout              [✓] pyproject.toml structure
-[✓] Test organization        [✓] CI/CD workflows
-[✓] Pre-commit config        [✓] Quarto notebooks pattern
-```
-
----
-
-## WORKSHOP MATERIALS
-
-**CBG Retreat 2026** | ETH Zurich | January 21-23, 2026
-
-| Resource | Location |
-|----------|----------|
-| Slides | `docs/slides.qmd` |
-| Tutorial | `docs/TUTORIAL.md` |
-| Render | `pixi run slides` |
-
----
-
-## EXTERNAL REFERENCES
-
-| Tool | Documentation |
-|------|---------------|
-| Pixi | [pixi.sh](https://pixi.sh) |
-| Ruff | [docs.astral.sh/ruff](https://docs.astral.sh/ruff) |
-| Pydantic | [docs.pydantic.dev](https://docs.pydantic.dev) |
-| Hypothesis | [hypothesis.readthedocs.io](https://hypothesis.readthedocs.io) |
-| Quarto | [quarto.org](https://quarto.org) |
-| PyMC | [pymc.io](https://www.pymc.io) |
-
----
-
-## CONTRIBUTING
+Draws `--repetitions` random cell counts per input dataset and writes
+`subsample_lookup_table.tsv`, which defines the pipeline's targets. Each output
+filename carries a short random hash so that repeated draws of the same cell
+count do not collide.
 
 ```bash
-# 1. Fork repository
-# 2. Create feature branch
-git checkout -b feature/enhancement
-
-# 3. Make changes
-# 4. Verify compliance
-pixi run check
-
-# 5. Commit (pre-commit enforces standards)
-git commit -m "feat: add enhancement"
-
-# 6. Push and create PR
-git push -u origin feature/enhancement
+pixi run python src/mutation_call_variability/create_lookup_table.py \
+    --input <sample1>.cells.loom <sample2>.cells.loom <sample3>.cells.loom \
+    --repetitions 100 \
+    --output_folder_lookup workflow/config/ \
+    --output_folder results
 ```
 
----
+See `workflow/config/README` for the exact invocation used to produce the
+committed lookup table.
 
-## LICENSE
+### 2. Run the workflow
 
-MIT License — see [LICENSE](LICENSE)
-
----
-
-<div align="center">
-
-```
-═══════════════════════════════════════════════════════════════════════════════
-  HIVE-PROTOCOL | RESEARCH SOFTWARE CONTAINMENT STANDARD | STATUS: OPERATIONAL
-═══════════════════════════════════════════════════════════════════════════════
+```bash
+pixi run workflow-dry   # dry run: show what would be executed
+pixi run workflow       # submit rules as SLURM jobs
 ```
 
-*Built with modern Python for computational biology*
+The pipeline has four rules:
 
-**CBG-ETH Zurich**
+| Rule                     | Does                                                              |
+| ------------------------ | ----------------------------------------------------------------- |
+| `subsample_loom`         | Subsample cells from the full loom file to the target cell count   |
+| `mosaic_subsample`       | Variant calling + filtering on each subsampled loom file           |
+| `mosaic_full`            | Variant calling + filtering on the full (un-subsampled) dataset    |
+| `compute_jaccard_indices`| Jaccard index of each subsample's variant set vs. its full dataset |
 
-</div>
+Final output is `<output_directory>/jaccard_indices.tsv` with columns `hash`,
+`paper_id`, `n_cells`, `jaccard_index`.
+
+Memory is requested via `mem_mb_per_cpu` and scales with the retry attempt
+(`get_mem_mb` in the Snakefile doubles it each time), because peak usage varies
+with subsample size. Euler rejects `--mem` (memory-by-node), so resources must be
+expressed per-CPU.
+
+### 3. Analyse the results
+
+```bash
+pixi run docs   # renders notebooks/ with Quarto
+```
+
+`notebooks/regression.qmd` checks that the drawn cell counts really are uniformly
+distributed (Q-Q plots, one panel per sample) and then regresses the Jaccard
+index on cell count.
+
+## Development
+
+```bash
+pixi run lint            # ruff check
+pixi run format          # ruff format
+pixi run typecheck       # pyright (fast, local)
+pixi run typecheck-ci    # mypy (used in CI/pre-commit)
+pixi run docstring-cov   # interrogate, --fail-under=80
+pixi run test            # pytest
+pixi run check           # all of the above
+pixi run hooks           # install pre-commit hooks
+```
+
+Note that `tests/` is currently empty, so `pixi run test` (and therefore
+`pixi run check`) collects nothing.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

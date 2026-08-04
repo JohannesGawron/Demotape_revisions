@@ -1,0 +1,5 @@
+Subsample lookup table is generated using the command
+
+```
+pixi run python src/mutation_call_variability/create_lookup_table.py --input /cluster/work/bewi/members/jgawron/INTeRCePT/pipeline_output/GFB-4397_GFB-4401_out/dna/results/GFB-4397_GFB-4401.cells.loom /cluster/work/bewi/members/jgawron/INTeRCePT/pipeline_output/GFB-4396_GFB-4400_out/dna/results/GFB-4396_GFB-4400.cells.loom /cluster/work/bewi/members/jgawron/INTeRCePT/pipeline_output/GFB-4395_GFB-4399_out/dna/results/GFB-4395_GFB-4399.cells.loom --repetitions 100 --output_folder_lookup /cluster/work/bewi/members/jgawron/projects/Demotape_revisions/mutation_call_variability/workflow/config/ --output_folder /cluster/work/bewi/members/jgawron/projects/Demotape_revisions/mutation_call_variability/results
+```

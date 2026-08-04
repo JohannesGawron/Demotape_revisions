@@ -1,0 +1,12 @@
+executor: slurm
+latency-wait: 60
+jobs: 500
+rerun-incomplete: True
+retries: 3
+
+
+default-resources:
+    mem_mb_per_cpu: 4096
+    slurm_account: "'es_beere'"
+    time: 240
+    cores: 400 

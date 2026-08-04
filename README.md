@@ -79,7 +79,7 @@ export PIXI_CACHE_DIR=/scratch/$USER-pixi-cache
 The nested step then cannot inherit the job's memory allocation and falls back to
 the cluster's default mem-per-cpu, so jobs are OOM-killed at ~1 GB regardless of
 what `mem_mb_per_cpu` requests. Do not lift this pin without re-testing;
-`repro_oom_bug/` contains a minimal reproduction.
+`repro_oom_bug/` contains a minimal reproduction. For details, see this [PR](https://github.com/snakemake/snakemake-executor-plugin-slurm-jobstep/pull/51).
 
 ## Running the analysis
 

@@ -97,7 +97,7 @@ snakemake-executor-plugin-slurm-jobstep = "<0.6.1"
 kernel = "python -m ipykernel install --user --name python3 --display-name 'Python 3 (mutation_call_variability)'"
 
 # Render Quarto notebooks
-docs = { cmd = "quarto render notebooks/*", depends-on = ["kernel"] }
+docs = { cmd = "quarto render notebooks/*.qmd", depends-on = ["kernel"] }
 
 # Run tests
 test = "pytest tests/ -v"

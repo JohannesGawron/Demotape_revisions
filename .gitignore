@@ -135,7 +135,9 @@ docs/slides_files/
 !docs/*.md
 !docs/*.qmd
 !docs/*.scss
-
+notebooks/*.html
+notebooks/*.png
+notebooks/*files/
 # Snakemake
 .snakemake/
 

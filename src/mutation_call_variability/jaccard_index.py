@@ -11,7 +11,11 @@ import polars as pl
 
 
 def load_variant_set(path: str) -> set[tuple[str, int, str, str]]:
-    df = pl.read_csv(path, columns=["CHR", "POS", "REF", "ALT"])
+    df = pl.read_csv(
+        path,
+        columns=["CHR", "POS", "REF", "ALT"],
+        dtypes={"CHR": pl.Utf8, "POS": pl.Int64, "REF": pl.Utf8, "ALT": pl.Utf8},
+    )
     return set(df.iter_rows())
 
 

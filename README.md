@@ -128,7 +128,7 @@ expressed per-CPU.
 ### 3. Analyse the results
 
 ```bash
-pixi run docs   # renders notebooks/ with Quarto
+pixi run regressions   # renders notebooks/ with Quarto
 ```
 
 `notebooks/regression.qmd` checks that the drawn cell counts really are uniformly

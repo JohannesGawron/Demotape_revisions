@@ -1,3 +1,8 @@
+"""
+Author: Johannes Gawron Wegner
+Date: 2026-08-06
+"""
+
 import argparse
 import uuid
 from pathlib import Path

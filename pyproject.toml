@@ -186,8 +186,7 @@ ignore_missing_imports = true
 # =============================================================================
 
 [tool.interrogate]
-# Omit files
-exclude = ['_version_generated.py']
+exclude = ['*_version_generated.py']
 
 # =============================================================================
 # Pytest - Testing framework

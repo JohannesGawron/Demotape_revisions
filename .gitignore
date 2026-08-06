@@ -143,6 +143,10 @@ docs/slides_files/
 results/*.parquet
 results/*.csv
 results/*.html
+results/*.tsv
+results/*.loom
+results/*filtered_variants.csv
+results/*filtered_variants_gt.csv
 
 # Secrets (but NOT .secrets.baseline - needed for detect-secrets hook)
 .env
@@ -156,9 +160,6 @@ data/*.parquet
 data/*.h5
 data/*.hdf5
 !data/.gitkeep
-results/*.loom
-results/*filtered_variants.csv
-results/*filtered_variants_gt.csv
 
 # Model outputs
 *.pkl

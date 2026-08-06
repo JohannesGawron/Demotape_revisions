@@ -1,0 +1,435 @@
+---
+title: "Regression analysis"
+subtitle: "This notebook performs regression analysis to assess if mutation calling concordance is correlated with cell count."
+author: "Johannes Gawron Wegner, CBG-ETH Zurich"
+date: "2026-08-03"
+format:
+  html:
+    code-fold: true
+    toc: true
+execute:
+  freeze: auto
+jupyter: python3
+---
+
+## Input data
+
+The data table is `jaccard_indices.tsv`, as creataed by the workflow defined in `workflow/Snakefile`. It contains the following columns:
+
+- `hash`: A unique identifier of the subsample
+- `paper_id`: The sample ID, as it is called in the Demotape paper.
+- `n_cells`: The number of cells in the subsample.
+- `jaccard_index`: The Jaccard similarity index between predicted and true mutations. True mutations are defined as the ones called on the full dataset.
+
+## Load data and do checks
+
+Let's load the data and check that columns are as expected. Also, let's do a quality check that the n_cells is uniformly downsampled from the total number of cells.
+
+```{python}
+#| label: input-check
+#| echo: true
+
+import numpy as np
+import polars as pl
+import matplotlib.pyplot as plt
+
+df = pl.read_csv('/cluster/work/bewi/members/jgawron/projects/Demotape_revisions/mutation_call_variability/results/jaccard_indices.tsv', separator='\t')
+print(df.columns)
+
+sample_ids = sorted(df['paper_id'].unique().to_list())
+fig, axes = plt.subplots(1, len(sample_ids), figsize=(3 * len(sample_ids), 2.5), squeeze=False)
+
+for ax, sample in zip(axes[0], sample_ids):
+    n_cells = len(pl.read_csv(f'/cluster/work/bewi/members/jgawron/projects/Demotape_revisions/mutation_call_variability/results/{sample}.full.filtered_variants_gt.csv', separator=',').columns)-1
+    print(f"Sample {sample} has {n_cells} cells in the full dataset.")
+
+    observed = np.sort(df.filter(pl.col('paper_id') == sample)['n_cells'].to_numpy())
+    n = observed.size
+
+    # Plotting positions (i - 0.5) / n, mapped onto the uniform support
+    # spanned by the observed counts for this sample.
+    probs = (np.arange(1, n + 1) - 0.5) / n
+    lo, hi = 1, n_cells
+    theoretical = lo + probs * (hi - lo)
+
+    ax.scatter(theoretical, observed, s=12, alpha=0.6, edgecolor='none')
+    ax.plot([lo, hi], [lo, hi], color='crimson', lw=1.5, label='y = x')
+    ax.set_title(f'{sample} (n = {n})')
+    ax.set_xlabel('Theoretical uniform quantiles')
+    ax.set_ylabel('Observed n_cells')
+    ax.legend(loc='upper left', frameon=False)
+
+fig.suptitle('Q-Q plots of n_cells vs. uniform distribution', y=1.02)
+fig.tight_layout()
+plt.show()    
+```
+
+
+## Regression analysis
+
+Next, we will perform regression analysis to assess if mutation calling concordance (as measured by the Jaccard index) is correlated with cell count. We will use a regression model for this purpose.
+
+```{python}
+#| label: data-exploration-1
+#| echo: true
+
+colors = {'S1': '#6580E2', 'S2': '#FFE119', 'S3': '#5FCA6C'}
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+for ax, sample in zip(axes, ['S1', 'S2', 'S3']):
+  df_sub = df.filter(pl.col('paper_id') == sample)
+  ax.scatter(df_sub['n_cells'], df_sub['jaccard_index'], alpha=0.6, edgecolor='none', label=sample, color=colors[sample])
+  
+  ax.set_xlabel('Number of cells')
+  ax.set_ylabel('Jaccard index')
+  ax.set_title(f'{sample}: Jaccard index vs. Number of cells')
+  ax.legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+
+The plots show a strong correlation between the jaccard index and the number of cells, but the relationship seems non-linear. The goal is to find a model that accounts for the non-linearity and shows that most of the variance of the Jaccard index can be explained by the number of cells in the dataset.
+
+First of all, to account for the boundedness of the Jaccard index, let's make two assumptions:
+
+* For each sample, the Jaccard index is beta-distributed around a mean that is a function of the number of cells.
+* The dependencies of the means of the beta distributions on the number of cells has the same functional form for all samples.
+
+To better understand this functional form, let's transform the (bounded) Jaccard index to the real line using the logit transformation and plot it against the number of cells.
+```{python}
+#| label: data-exploration-2
+#| echo: true
+from scipy.special import logit
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+for ax, sample in zip(axes, ['S1', 'S2', 'S3']):
+  df_sub = df.filter(pl.col('paper_id') == sample)
+  ax.scatter(df_sub['n_cells'], logit(df_sub['jaccard_index']), alpha=0.6, edgecolor='none', label=sample, color=colors[sample])
+  ax.set_xlabel('Number of cells')
+  ax.set_ylabel('logit(Jaccard index)')
+  ax.set_title(f'{sample}: logit(Jaccard index) vs. Number of cells')
+  ax.legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+The relationship between the logit-transformed Jaccard index and the number of cells still seems curved, but potentially, log-transforming the X-axis may help:
+
+```{python}
+#| label: data-exploration-3
+#| echo: true
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+for ax, sample in zip(axes, ['S1', 'S2', 'S3']):
+  df_sub = df.filter(pl.col('paper_id') == sample)
+  ax.scatter(np.log(df_sub['n_cells']), logit(df_sub['jaccard_index']), alpha=0.6, edgecolor='none', label=sample, color=colors[sample])
+  ax.set_xlabel('log(Number of cells)')
+  ax.set_ylabel('logit(Jaccard index)')
+  ax.set_title(f'{sample}: logit(Jaccard index) vs. log(Number of cells)')
+  ax.legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+Visual inspection suggests that a cubic polynomial of the log number of cells could describe the relationship well, though with different coefficients. This allows to formulate a statistical model: Define $Y_{S_{i}}$ as the Jaccard index of sample $S_i$. We assume
+
+$$
+Y\sim Beta(\mu_{i}\cdot\phi,(1 - \mu_{i})\cdot\phi)
+$$
+
+Where $\mu_{i}$ and $\phi$ are the mean and precision parameters of the Beta-distribution, respectively. Let $n_i$ be the number of cells in sample $i$. The mean is linked to the predictors via a logit link function:
+$$
+\text{logit}(\mu_i) = \beta_0 + \beta_1 \log(n_i) + \beta_2 \log(n_i)^2 + \beta_3 \log(n_i)^3
+$$
+
+
+```{python}
+#| label: regression-by-sample
+#| echo: true
+'''
+Beta Regression for Jaccard index ~ cubic polynomial in log(n_cells)
+
+Note: phi is a (constant) precision parameter: higher phi means the Beta draws are
+tighter around the mean. statsmodels' BetaModel puts phi behind a log link
+by default, so the last fitted parameter is log(phi), not phi itself.
+'''
+from scipy.stats import spearmanr
+from statsmodels.othermod.betareg import BetaModel
+
+def compute_r2(y_true: np.ndarray, y_pred: np.ndarray)-> float:
+    """Coefficient of determination: fraction of variance explained by the model."""
+    if y_true.shape != y_pred.shape:
+        raise ValueError(f"y_true and y_pred must have the same shape, got {y_true.shape} and {y_pred.shape}")
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+    return 1 - (ss_res / ss_tot)
+
+
+samples = ['S1', 'S2', 'S3']
+ # ── Handle boundary values (Beta requires strict (0, 1)) ─────────────────
+# A standard small correction: squeeze exact 0s and 1s slightly inward.
+# eps chosen so that logit(eps) ≈ ±log(N).
+
+N = len(df)
+eps = 0.5 / N
+
+df = df.with_columns([
+    pl.col('n_cells').cast(pl.Float64).log().alias('log_n_cells'),
+    pl.col('jaccard_index').cast(pl.Float64).clip(eps, 1 - eps).alias('jaccard_index_adj')
+])
+
+
+spearman_by_sample = {}
+DEGREE = 3  # cubic in log(n_cells), i.e. b0 + b1*log(x) + b2*log(x)^2 + b3*log(x)^3
+fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+
+for idx, sample in enumerate(['S1', 'S2', 'S3']):
+    df_sub = df.filter(pl.col('paper_id') == sample)
+
+    n_cells = df_sub['n_cells'].to_numpy()
+    jaccard = df_sub['jaccard_index'].to_numpy()
+
+
+    # ── Setup model and fit ──────────────────────────────────────────────────
+    log_n_cells = df_sub.select('log_n_cells').to_numpy()
+    jaccard_adj = df_sub.select('jaccard_index_adj').to_numpy().flatten()
+    X = np.column_stack([log_n_cells ** p for p in range(DEGREE + 1)])  # [1, log(x), log(x)^2, log(x)^3]
+
+    model = BetaModel(jaccard_adj, X)
+    result = model.fit(disp=False)
+
+    print(f"=== Sample {sample} ===")
+    print(result.summary())
+
+    # ── Extract key statistics ───────────────────────────────────────────────
+    betas = result.params[:DEGREE + 1]
+    phi = np.exp(result.params[-1])  # undo the log link on the precision parameter
+
+    terms = ' + '.join(
+        f'{b:.3f}' if p == 0 else f'{b:.3f}*log(n_cells)^{p}'
+        for p, b in enumerate(betas)
+    )
+    print(f'\nFitted model: logit(mu) = {terms}')
+    print(f'Precision phi: {phi:.2f}  (higher = tighter fit around mean)')
+
+    # Coefficient of determination: the fraction of the variance of the
+    # observed Jaccard index explained by the fitted mean.
+    fitted_mu = result.predict()
+    r2 = compute_r2(jaccard_adj, fitted_mu)
+    print(f'R² (variance explained): {r2:.4f}\n')
+
+    mask = (df_sub['paper_id'] == sample).to_numpy()
+    rho, spearman_pvalue = spearmanr(log_n_cells, jaccard_adj)
+    spearman_by_sample[sample] = rho
+    
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    n_grid = np.linspace(n_cells.min(), n_cells.max(), 300)
+    log_grid = np.log(n_grid)
+    X_grid = np.column_stack([log_grid ** p for p in range(DEGREE + 1)])
+
+    mu_grid = result.predict(exog=X_grid)
+
+    # 95% confidence band via delta method (on the logit scale, then back-transform)
+    cov = result.cov_params()[:DEGREE + 1, :DEGREE + 1]  # covariance of the beta's only
+    se_eta = np.sqrt(np.einsum("ij,ni,nj->n", cov, X_grid, X_grid))  # se of linear predictor
+    eta_grid = np.log(mu_grid / (1 - mu_grid))
+    ci_lo = 1 / (1 + np.exp(-(eta_grid - 1.96 * se_eta)))
+    ci_hi = 1 / (1 + np.exp(-(eta_grid + 1.96 * se_eta)))
+
+    # — Top row: fitted curve with CI ————————————————————————————————————————
+    ax = axes[0, idx]
+    ax.scatter(
+        n_cells, jaccard_adj, alpha=0.6, s=30, color=colors[sample],
+        label=f"Observed (Spearman ρ={spearman_by_sample[sample]:.3f})",
+    )
+    ax.plot(n_grid, mu_grid, color="tomato", lw=2, label="Beta regression mean")
+    ax.fill_between(n_grid, ci_lo, ci_hi, color="tomato", alpha=0.15, label="95% CI")
+    ax.set_xlabel("Number of cells")
+    ax.set_ylabel("Jaccard index")
+    ax.set_title(f"{sample}: Beta regression fit (cubic in log n_cells)\nR² = {r2:.3f}")
+    ax.legend()
+
+    # — Bottom row: residual plot ————————————————————————————————————————————
+    ax = axes[1, idx]
+    residuals = jaccard_adj - fitted_mu
+    ax.scatter(fitted_mu, residuals, alpha=0.6, s=30, color=colors[sample])
+    ax.axhline(0, color="tomato", lw=1.5, ls="--")
+    ax.set_xlabel("Fitted μ")
+    ax.set_ylabel("Residual (observed − fitted)")
+    ax.set_title(f"{sample}: Residual plot")
+
+plt.tight_layout()
+plt.show()
+```
+
+## Pooled regression with sample × polynomial interactions
+
+This look encouraging. Now, as a last step, I want to formally ask, how much of the variance in the data is captured by the number of cells under the given functional form. Therefore, we now fit a single Beta
+regression across all samples jointly, adding `paper_id` as a categorical predictor. We suspect that model coefficients vary across samples, and we model this as interactions between `paper_id` and the polynomial terms in
+every power of `log(n_cells)`. To verify that this interaction is indeed explanatory, I perform a likelihood-ratio test against a reduced model that has no interactions and only differs in the offset of the model.
+
+Model specification:
+$$
+\begin{align*}
+\text{logit}(\mu_i) = &\beta_0 + \beta_1 \log(n_i) + \beta_2 \log(n_i)^2 + \beta_3 \log(n_i)^3 + \\
+&\sum_{s} \mathbb{1}[\text{sample}_i = s] \left( \gamma_{0,s} + \gamma_{1,s} \log(n_i) + \gamma_{2,s} \log(n_i)^2 + \gamma_{3,s} \log(n_i)^3 \right)
+\end{align*}
+$$
+
+for every non-reference sample $s$ (one sample is chosen as the reference and absorbed into $\beta_0..\beta_3$).
+The implied per-sample curves are numerically the same as fitting
+each sample separately, except that the precision $\phi$ is shared and estimated jointly. To test whether the interaction terms are needed at all, we do a likelihood-ratio test against the no-interaction model (only the offset differs between samples).
+
+```{python}
+#| label: pooled-regression
+#| echo: true
+
+import pandas as pd
+import patsy
+import seaborn as sns
+from scipy.stats import chi2
+
+# Match the plotting style used elsewhere in the manuscript
+# (see https://github.com/cbg-ethz/demoTape/blob/7761b3dc3bb03c26a8ab66c948339d3ba536b4eb/workflow/scripts/plot_simulations_benchmark.py): a gridded (not plain white)
+# background, and somewhat larger/bolder text and ticks than matplotlib's
+# defaults. Font size is scaled down from that script's 30pt (tuned for a
+# single large print figure) to fit this notebook's smaller two-panel layout.
+sns.set_style('whitegrid')
+FONTSIZE = 20
+sns.set_context('paper', rc={
+    'font.size': FONTSIZE,
+    'axes.labelsize': 'medium',
+    'axes.titlesize': 'large',
+    'xtick.labelsize': 'medium',
+    'ytick.labelsize': 'medium',
+    'legend.fontsize': 'medium',
+    'legend.title_fontsize': 'large',
+    'axes.axisbelow': True,
+    'lines.linewidth': 1,
+    'xtick.major.size': 6,
+    'ytick.major.size': 6,
+})
+
+DEGREE = 3
+REFERENCE_SAMPLE = 'S1'
+samples = ['S1', 'S2', 'S3']
+
+# patsy (used by BetaModel.from_formula) requires pandas: indexing a polars
+# DataFrame with a missing key raises polars.exceptions.ColumnNotFoundError
+# instead of a KeyError, which breaks patsy's variable-lookup fallback and is
+# what caused the `"I" not found` error. Build a small pandas frame from the
+# polars columns directly via .to_list()/.to_numpy() (not .to_pandas(), which
+# additionally requires pyarrow), with short names matching the formula.
+pdf = pd.DataFrame({
+    'paper_id': df['paper_id'].to_list(),
+    'n_cells': df['n_cells'].to_numpy(),
+    'log_n': df['log_n_cells'].to_numpy(),
+    'jaccard_adj': df['jaccard_index_adj'].to_numpy(),
+})
+
+poly_terms = ' + '.join(f'I(log_n**{p})' if p > 1 else 'log_n' for p in range(1, DEGREE + 1))
+formula_full = (
+    f'jaccard_adj ~ C(paper_id, Treatment(reference="{REFERENCE_SAMPLE}")) * ({poly_terms})'
+)
+formula_reduced = f'jaccard_adj ~ C(paper_id, Treatment(reference="{REFERENCE_SAMPLE}")) + ({poly_terms})'  # single shared curve, sample effect only in the intercept
+
+result_full = BetaModel.from_formula(formula_full, data=pdf).fit(disp=False)
+result_reduced = BetaModel.from_formula(formula_reduced, data=pdf).fit(disp=False)
+
+print(result_full.summary())
+
+# ── Likelihood-ratio test: do the sample-specific curves differ at all? ─────
+lr_stat = 2 * (result_full.llf - result_reduced.llf)
+lr_df = len(result_full.params) - len(result_reduced.params)
+lr_pvalue = chi2.sf(lr_stat, lr_df)
+print(f"\nLR test (sample interactions vs. single shared curve): "
+      f"stat={lr_stat:.2f}, df={lr_df}, p={lr_pvalue:.2e}")
+
+phi = np.exp(result_full.params['precision'])  # shared precision, log link
+print(f"Shared precision phi: {phi:.2f}")
+
+
+# ── Recover the implied per-sample cubic from baseline + interaction terms ──
+dummy_prefix = f'C(paper_id, Treatment(reference="{REFERENCE_SAMPLE}"))'
+baseline_names = ['Intercept', 'log_n', 'I(log_n ** 2)', 'I(log_n ** 3)']
+for sample in samples:
+    if sample == REFERENCE_SAMPLE:
+        coefs = [result_full.params[name] for name in baseline_names]
+    else:
+        dummy = f'{dummy_prefix}[T.{sample}]'
+        coefs = [result_full.params[baseline_names[0]] + result_full.params[dummy]]
+        coefs += [
+            result_full.params[name] + result_full.params[f'{dummy}:{name}']
+            for name in baseline_names[1:]
+        ]
+    print(f"{sample}: logit(mu) = {coefs[0]:.3f} + {coefs[1]:.3f}*log(n) "
+          f"+ {coefs[2]:.3f}*log(n)^2 + {coefs[3]:.3f}*log(n)^3")
+
+# ── Goodness of fit of the overall joint model: overall R² (variance explained)
+fitted_mu_all = np.asarray(result_full.predict()).flatten()
+pearson_r2 = compute_r2(pdf['jaccard_adj'].to_numpy().flatten(), fitted_mu_all)
+print(f"\nOverall R² (variance explained, all samples pooled): {pearson_r2:.4f}")
+
+# ── Plot: one fitted curve + CI per sample, from the single pooled model ────
+design_info = result_full.model.data.design_info
+mean_names = [n for n in result_full.params.index if n != 'precision']
+cov_mean = result_full.cov_params().loc[mean_names, mean_names].to_numpy()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+for sample in samples:
+    pdf_sub = pdf[pdf['paper_id'] == sample]
+
+    n_cells = pdf_sub['n_cells'].to_numpy()
+    jaccard_adj = pdf_sub['jaccard_adj'].to_numpy()
+
+    n_grid = np.linspace(n_cells.min(), n_cells.max(), 300)
+    grid = pd.DataFrame({'paper_id': sample, 'log_n': np.log(n_grid)})
+
+    mu_grid = np.asarray(result_full.predict(exog=grid))
+    X_grid = np.asarray(patsy.build_design_matrices([design_info], grid)[0])
+    se_eta = np.sqrt(np.einsum("ij,ni,nj->n", cov_mean, X_grid, X_grid))
+    eta_grid = np.log(mu_grid / (1 - mu_grid))
+    ci_lo = 1 / (1 + np.exp(-(eta_grid - 1.96 * se_eta)))
+    ci_hi = 1 / (1 + np.exp(-(eta_grid + 1.96 * se_eta)))
+
+    ax = axes[0]
+    ax.scatter(n_cells, jaccard_adj, alpha=0.4, s=20, color=colors[sample])
+    ax.plot(
+        n_grid, mu_grid, color=colors[sample], lw=2,
+        label=f"{sample} (Spearman ρ={spearman_by_sample[sample]:.3f})",
+    )
+    ax.fill_between(n_grid, ci_lo, ci_hi, color=colors[sample], alpha=0.15)
+
+    fitted_mu_sample = np.asarray(result_full.predict(exog=pdf_sub))
+    residuals = jaccard_adj - fitted_mu_sample
+    axes[1].scatter(fitted_mu_sample, residuals, alpha=0.4, s=20, color=colors[sample], label=sample)
+
+axes[0].set_xlabel("Number of cells")
+axes[0].set_ylabel("Jaccard index")
+#axes[0].set_title(
+#     "Mutation call concordance after subsampling\n"
+#     f"Overall R² (variance explained) = {pearson_r2:.3f}"
+# )
+axes[0].plot([], [], ' ', label=f"SR² = {pearson_r2:.3f}")
+axes[0].legend()
+
+axes[1].axhline(0, color="black", lw=1, ls="--")
+axes[1].set_xlabel("Fitted mean μ")
+axes[1].set_ylabel("Residual (observed − fitted)")
+# axes[1].set_title("Residual plot, all samples")
+axes[1].legend()
+
+plt.tight_layout()
+plt.savefig("mutation_call_concordance_regression.png", dpi=300, bbox_inches="tight")
+plt.show()
+```
+
+Note that `phi` is shared across samples here, in order to prevent the model from becoming overparameterized (the precision submodel uses only an intercept by default).

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
+"""Takes a loom file and produces a list of variant calls."""
 
 import argparse
 import gc
-from itertools import combinations
 import os
 import re
 import shutil
 import tempfile
-
 
 import loompy
 import numpy as np
@@ -16,23 +15,27 @@ import pandas as pd
 EPSILON = np.finfo(np.float64).resolution
 
 CHR_ORDER = {str(i): i for i in range(1, 23)}
-CHR_ORDER.update({'X':23, 'Y':24})
+CHR_ORDER.update({'X': 23, 'Y': 24})
 
-WHITELIST = []
+WHITELIST: list[str] = []
 
-VCF_HEADER ='##fileformat=VCFv4.3\n' \
-    '##source=demoTape simulations\n' \
-    '{contigs}' \
-    '##FORMAT=<ID=GT,Number=1,Type=String,Description="Called ML genotype">\n' \
-    '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">\n' \
-    '##FORMAT=<ID=AD,Number=1,Type=Integer,Description="Alternative depth">\n' \
+VCF_HEADER = (
+    '##fileformat=VCFv4.3\n'
+    '##source=demoTape simulations\n'
+    '{contigs}'
+    '##FORMAT=<ID=GT,Number=1,Type=String,Description="Called ML genotype">\n'
+    '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">\n'
+    '##FORMAT=<ID=AD,Number=1,Type=Integer,Description="Alternative depth">\n'
     '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{cells}\n'
+)
 
 VCF_BODY_ROW = '{chr}\t{pos}\t{chr}:{pos}\t{ref}\t{alt}\t.\tPASS\t.\tGT:DP:AD\t{data}\n'
 
 
 def get_assignment_dict(assignment_file):
-    df = pd.read_csv(assignment_file, index_col=0, dtype='str',sep='\t').T
+    """Read in assignment file and return a dictionary with cluster names as keys and cell indices as values."""
+
+    df = pd.read_csv(assignment_file, index_col=0, dtype='str', sep='\t').T
 
     clusters = {}
     for cl in df['Cluster'].unique():
@@ -43,11 +46,20 @@ def get_assignment_dict(assignment_file):
 
 
 def get_WL_ids(df):
+    """Return the indices of variants in the dataframe that are present in the whitelist."""
+
     ids = df['CHR'].astype(str) + '_' + df['POS'].astype(str)
     return np.argwhere(np.isin(ids.values, WHITELIST)).flatten()
 
 
 def main(args):
+    """
+    This script can
+    * Generate in-silico multiplexed loom files
+    * Filter a single loom file equal to MissionBio mosaic
+    * Split cells from a single loom file into several subsets and and filter each subset equal to MissionBio mosaic
+    """
+
     if args.assignment:
         assign = get_assignment_dict(args.assignment)
     else:
@@ -80,8 +92,15 @@ def main(args):
         if len(WHITELIST) != 0:
             df4, gt4 = filter_variants_WL(df4, gt4, args)
 
-        SNP_id = df4['CHR'] + ':' + df4['POS'].astype(str) + ':' + df4['REF'] \
-            + '/' + df4['ALT']
+        SNP_id = (
+            df4['CHR']
+            + ':'
+            + df4['POS'].astype(str)
+            + ':'
+            + df4['REF']
+            + '/'
+            + df4['ALT']
+        )
         cells = df4.columns[7:].values
 
         if not args.output:
@@ -106,7 +125,7 @@ def main(args):
         variant_file = f'{out_base_file}.filtered_variants.csv'
         print(f'Writing variant  file to: {variant_file}')
         df4.to_csv(variant_file, index=False, header=True)
-        
+
         gt_file = f'{out_base_file}.filtered_variants_gt.csv'
         print(f'Writing genotype file to: {gt_file}')
         pd.DataFrame(gt4, index=SNP_id, columns=cells).to_csv(gt_file)
@@ -124,28 +143,34 @@ def main(args):
             f.write('\n'.join(cells))
 
         try:
-            RD = df4.iloc[:,7:].map(lambda x: int(x.split(':')[0])) \
+            RD = df4.iloc[:, 7:].map(lambda x: int(x.split(':')[0])).set_index(SNP_id)
+            AD = df4.iloc[:, 7:].map(lambda x: int(x.split(':')[1])).set_index(SNP_id)
+        except AttributeError:  # Older pandas versions < 2.1.0
+            RD = (
+                df4.iloc[:, 7:]
+                .applymap(lambda x: int(x.split(':')[0]))
                 .set_index(SNP_id)
-            AD = df4.iloc[:,7:].map(lambda x: int(x.split(':')[1])) \
+            )
+            AD = (
+                df4.iloc[:, 7:]
+                .applymap(lambda x: int(x.split(':')[1]))
                 .set_index(SNP_id)
-        except AttributeError: # Older pandas versions < 2.1.0
-            RD = df4.iloc[:,7:].applymap(lambda x: int(x.split(':')[0])) \
-                .set_index(SNP_id)
-            AD = df4.iloc[:,7:].applymap(lambda x: int(x.split(':')[1])) \
-                .set_index(SNP_id)
+            )
         DP = RD + AD
 
         RD_sm_file = f'{out_base_file}.filtered_variants_RD.mtx'
         AD_sm_file = f'{out_base_file}.filtered_variants_AD.mtx'
         with open(RD_sm_file, 'w') as f_r, open(AD_sm_file, 'w') as f_a:
             for f in [f_r, f_a]:
-                f.write('%%MatrixMarket matrix coordinate real general\n' \
-                    '% written by distance-demulti\n'\
-                    f'{SNP_id.size} {cells.size} {gt4.size}\n')
+                f.write(
+                    '%%MatrixMarket matrix coordinate real general\n'
+                    '% written by distance-demulti\n'
+                    f'{SNP_id.size} {cells.size} {gt4.size}\n'
+                )
             for snv in range(SNP_id.size):
                 for cell in range(cells.size):
-                    f_r.write(f'{snv+1} {cell+1} {RD.iloc[snv, cell]}\n')
-                    f_a.write(f'{snv+1} {cell+1} {AD.iloc[snv, cell]}\n')
+                    f_r.write(f'{snv + 1} {cell + 1} {RD.iloc[snv, cell]}\n')
+                    f_a.write(f'{snv + 1} {cell + 1} {AD.iloc[snv, cell]}\n')
 
         DP_T_file = f'{out_base_file}.filtered_variants_DP_T.csv'
         DP.T.to_csv(DP_T_file, index=True, header=True, index_label='cell_id')
@@ -161,21 +186,23 @@ def main(args):
 
 
 def save_vcf(df, out_file):
+    """Saves the variant call as a vcf file. Invocation depends on assignment flag."""
+
     def conv(x):
         RD, AD, GT = x.split(':')
         if GT == '3':
             return '.:.:.'
         else:
-            return f'{GT}:{int(RD)+int(AD)}:{AD}'
+            return f'{GT}:{int(RD) + int(AD)}:{AD}'
 
     cont = ''
     for i in df['CHR'].unique():
         cont += f'##contig=<ID={i}>\n'
 
     try:
-        df.iloc[:,7:] = df.iloc[:,7:].map(conv)
-    except AttributeError: # Older pandas versions < 2.1.0
-        df.iloc[:,7:] = df.iloc[:,7:].applymap(conv)
+        df.iloc[:, 7:] = df.iloc[:, 7:].map(conv)
+    except AttributeError:  # Older pandas versions < 2.1.0
+        df.iloc[:, 7:] = df.iloc[:, 7:].applymap(conv)
     body = ''
     for _, row in df.iterrows():
         body += VCF_BODY_ROW.format(
@@ -191,6 +218,7 @@ def save_vcf(df, out_file):
 
 
 def filter_variants(df, gt, VAF, args):
+    """Implementation of filtering steps from mosaic package."""
     ms1 = (gt == 0) & (VAF > args.max_ref_VAF)
     ms2 = (gt == 1) & (VAF < args.min_het_VAF)
     ms3 = (gt == 2) & (VAF < args.min_hom_VAF)
@@ -199,17 +227,19 @@ def filter_variants(df, gt, VAF, args):
     gt[ms] = 3
 
     try:
-        df_nan = df.iloc[:,7:].map(lambda x: x[:-1] + '3')
-    except AttributeError: # Older pandas versions < 2.1.0
-        df_nan = df.iloc[:,7:].applymap(lambda x: x[:-1] + '3')
-    df.iloc[:,7:] = df.iloc[:,7:].where(~ms, df_nan)
+        df_nan = df.iloc[:, 7:].map(lambda x: x[:-1] + '3')
+    except AttributeError:  # Older pandas versions < 2.1.0
+        df_nan = df.iloc[:, 7:].applymap(lambda x: x[:-1] + '3')
+    df.iloc[:, 7:] = df.iloc[:, 7:].where(~ms, df_nan)
 
     keep_var1 = np.mean(gt == 3, axis=1) < (1 - args.minVarGeno)
     if args.minMutated < 1:
         keep_var2 = np.mean((gt == 1) | (gt == 2), axis=1) >= args.minMutated
     elif args.minMutated == 1:
-        raise TypeError('--minMutated cannot be equactly 1. Values <1 are ' \
-            'interpreted as cell fraction, values >1 as absolute cell number.')
+        raise TypeError(
+            '--minMutated cannot be equactly 1. Values <1 are '
+            'interpreted as cell fraction, values >1 as absolute cell number.'
+        )
     else:
         keep_var2 = np.sum((gt == 1) | (gt == 2), axis=1) >= args.minMutated
 
@@ -220,6 +250,7 @@ def filter_variants(df, gt, VAF, args):
 
 
 def filter_variants_consecutive(df, gt, proximity):
+    """This filter removes variants that are to close to each other, becuasee they are likely to be caused by primer misalignment."""
     keep = np.ones(df.shape[0], dtype=bool)
 
     chrom = df['CHR'].values
@@ -228,8 +259,9 @@ def filter_variants_consecutive(df, gt, proximity):
     loc = 0
     while loc < len(chrom):
         found = 0
-        fa = np.argwhere((chrom == chrom[loc]) & (np.arange(len(chrom)) > loc)) \
-            .flatten()[::-1]
+        fa = np.argwhere(
+            (chrom == chrom[loc]) & (np.arange(len(chrom)) > loc)
+        ).flatten()[::-1]
         for jj in fa:
             for ii in range(len(proximity)):
                 if (pos[loc] + proximity[ii] > pos[jj]) & (jj - loc > ii):
@@ -246,6 +278,7 @@ def filter_variants_consecutive(df, gt, proximity):
 
 
 def filter_variants_WL(df, gt, args):
+    """Makes sure that whitelists are respected"""
     keep = np.ones(df.shape[0], dtype=bool)
     uniq_vars = df[df.duplicated(subset=['CHR', 'POS'])][['CHR', 'POS']]
 
@@ -272,12 +305,14 @@ def filter_variants_WL(df, gt, args):
 def postprocess_mosaic(df, gt):
     rmv_all = []
 
-    for ampl_sgl, ampl_data_raw in df.groupby('NAME'):
+    for _a, ampl_data_raw in df.groupby('NAME'):
         # Filter variants with '*' as REF or ALT
         bad_q = (ampl_data_raw['REF'] == '*') | (ampl_data_raw['ALT'] == '*')
         if bad_q.any():
-            print('Removed bad quality variants:\n' \
-                f'{ampl_data_raw.loc[bad_q].iloc[:,:5]}\n')
+            print(
+                'Removed bad quality variants:\n'
+                f'{ampl_data_raw.loc[bad_q].iloc[:, :5]}\n'
+            )
             rmv_all.extend(bad_q.index.values)
             ampl_data_raw = ampl_data_raw[~bad_q]
 
@@ -290,21 +325,26 @@ def postprocess_mosaic(df, gt):
         if dupl.any():
             df_dupl = ampl_data.loc[dupl]
             if dupl.sum() > 2:
-                print('Removed variants with >2 ALT at the same position:\n' \
-                    f'{ampl_data.loc[dupl].iloc[:,:5]}\n')
+                print(
+                    'Removed variants with >2 ALT at the same position:\n'
+                    f'{ampl_data.loc[dupl].iloc[:, :5]}\n'
+                )
                 rmv_all.extend(df_dupl.index.values)
                 continue
             # Remove if REF0 = ALT1 and REF1 = ALT0 in SAME POSITION
             REF0, ALT0 = df_dupl.iloc[0, 2:4]
             REF1, ALT1 = df_dupl.iloc[1, 2:4]
             if (REF0 == ALT1) & (REF1 == ALT0):
-                print(f'Removed shady alignment (unclear indel):\n'
-                    f'{df_dupl.iloc[:,:5]}\n')
+                print(
+                    f'Removed shady alignment (unclear indel):\n{df_dupl.iloc[:, :5]}\n'
+                )
                 rmv_all.extend(df_dupl.index.values)
                 ampl_data = ampl_data_raw[~dupl]
             elif len(REF0) != len(REF1) or len(ALT0) != len(ALT1):
-                print(f'Removed shady variants (different length indels):\n'
-                    f'{df_dupl.iloc[:,:5]}\n')
+                print(
+                    f'Removed shady variants (different length indels):\n'
+                    f'{df_dupl.iloc[:, :5]}\n'
+                )
                 rmv_all.extend(df_dupl.index.values)
                 ampl_data = ampl_data_raw[~dupl]
 
@@ -313,8 +353,10 @@ def postprocess_mosaic(df, gt):
         rmv_close = np.argwhere(np.diff(ampl_data['POS']) < 5).flatten()
         if rmv_close.size > 0:
             rmv_close = np.unique(np.concatenate([rmv_close, rmv_close + 1]))
-            print('Removed shady alignment (too close):' \
-                    f'\n{ampl_data.iloc[rmv_close,:5]}\n')
+            print(
+                'Removed shady alignment (too close):'
+                f'\n{ampl_data.iloc[rmv_close, :5]}\n'
+            )
             rmv_all.extend(ampl_data.iloc[rmv_close].index.values)
             keep_idx = [i for i in range(ampl_data.shape[0]) if i not in rmv_close]
             ampl_data = ampl_data.iloc[keep_idx]
@@ -335,6 +377,7 @@ def concat_str_arrays(arrays, sep='_'):
 
 
 def merge_gt(gt_in):
+    """Synthetically generate mixed doublet genotypes."""
     # 00=0, 11=1, 22=2, 33=3; 03=0, 13=1, 23=2; 01=1, 02=1, 12=1
     if gt_in[0] == gt_in[1]:
         return gt_in[0]
@@ -347,10 +390,12 @@ def merge_gt(gt_in):
 
 
 def multiplex_looms(args):
+    """If several loom files are given as input, they are multiplexed in silico."""
     no_samples = len(args.input)
-    assert no_samples == len(args.ratio), \
-        'No. input files has to be the same as no. ratios. ' \
-            f'({no_samples} != {len(args.ratio)})'
+    assert no_samples == len(args.ratio), (
+        'No. input files has to be the same as no. ratios. '
+        f'({no_samples} != {len(args.ratio)})'
+    )
     assert np.sum(args.ratio) <= 1, 'Ratios cannot sum up to >1.'
 
     no_cells = np.zeros(no_samples, dtype=int)
@@ -367,8 +412,9 @@ def multiplex_looms(args):
     samples_size = samples_total + (dbt_total * np.array(args.ratio)).astype(int)
 
     samples = {}
+    rng = np.random.default_rng()
     for i, size in enumerate(samples_size):
-        cells_multiplex = np.random.choice(no_cells[i], size=size, replace=False)
+        cells_multiplex = rng.choice(no_cells[i], size=size, replace=False)
         samples[i] = {'idx': np.sort(cells_multiplex)}
 
     for i, in_file in enumerate(args.input):
@@ -380,22 +426,28 @@ def multiplex_looms(args):
             # Open loom file and read data
             with loompy.connect(temp_in_file) as ds:
                 index = concat_str_arrays(
-                    [ds.ra['CHROM'], ds.ra['POS'], ds.ra['REF'], ds.ra['ALT']])
+                    [ds.ra['CHROM'], ds.ra['POS'], ds.ra['REF'], ds.ra['ALT']]
+                )
                 cols = samples[i]['idx'] + ((i + 1) / 10)
 
-                df_new = pd.DataFrame(ds[:, samples[i]['idx']],
-                    index=index, columns=cols)
+                df_new = pd.DataFrame(
+                    ds[:, samples[i]['idx']], index=index, columns=cols
+                )
                 ampl_new = pd.Series(ds.ra['amplicon'], index=index, name=0)
-                GQ_new = pd.DataFrame(ds.layers['GQ'][:,samples[i]['idx']],
-                    index=index, columns=cols)
-                AD_new = pd.DataFrame(ds.layers['AD'][:,samples[i]['idx']],
-                    index=index, columns=cols)
-                RO_new = pd.DataFrame(ds.layers['RO'][:,samples[i]['idx']],
-                    index=index, columns=cols)
-            
+                GQ_new = pd.DataFrame(
+                    ds.layers['GQ'][:, samples[i]['idx']], index=index, columns=cols
+                )
+                AD_new = pd.DataFrame(
+                    ds.layers['AD'][:, samples[i]['idx']], index=index, columns=cols
+                )
+                RO_new = pd.DataFrame(
+                    ds.layers['RO'][:, samples[i]['idx']], index=index, columns=cols
+                )
+
                 samples[i]['name'] = np.char.add(
                     ds.col_attrs['barcode'][samples[i]['idx']].astype(str),
-                    f'.pat{i:.0f}')
+                    f'.pat{i:.0f}',
+                )
 
         # First sample, nothing to merge
         if i == 0:
@@ -421,24 +473,27 @@ def multiplex_looms(args):
 
     # Downsample reference and alternative allele depth, if set
     if args.depth < 1:
-        print(f'Before downsampling:\n'
+        print(
+            f'Before downsampling:\n'
             f'\tAD mean depth: {AD.mean().mean()}\n'
-            f'\tRO mean depth: {RO.mean().mean()}')
+            f'\tRO mean depth: {RO.mean().mean()}'
+        )
         batch_size = 10000
         batches = AD.shape[0] // batch_size + 1
-        print(f'Downsampling reads to {args.depth*100:.0f}% ({batches} batches)')
+        print(f'Downsampling reads to {args.depth * 100:.0f}% ({batches} batches)')
         for i in range(batches):
             start_idx = i * batch_size
             end_idx = start_idx + batch_size
 
             for depth in (AD, RO):
-                down = np.random.binomial(
-                    depth.iloc[start_idx:end_idx,:].values, args.depth)
-                depth.iloc[start_idx:end_idx,:] = down.astype('int16')
-                
-        print(f'After downsampling:\n'
+                down = rng.binomial(depth.iloc[start_idx:end_idx, :].values, args.depth)
+                depth.iloc[start_idx:end_idx, :] = down.astype('int16')
+
+        print(
+            f'After downsampling:\n'
             f'\tAD mean depth: {AD.mean().mean()}\n'
-            f'\tRO mean depth: {RO.mean().mean()}')
+            f'\tRO mean depth: {RO.mean().mean()}'
+        )
     DP = AD + RO
 
     # Add doublets (if doublets arg specified)
@@ -452,11 +507,11 @@ def multiplex_looms(args):
     dbt_GQ = {}
     dbt_AD = {}
     dbt_RO = {}
-    for i in range(dbt_total):
-        s1, s2 = np.random.choice(no_samples, size=2, replace=False, p=s_probs)
+    for _i in range(dbt_total):
+        s1, s2 = rng.choice(no_samples, size=2, replace=False, p=s_probs)
 
-        c1_idx = np.random.choice(samples[s1]['idx'].size)
-        c2_idx = np.random.choice(samples[s2]['idx'].size)
+        c1_idx = rng.choice(samples[s1]['idx'].size)
+        c2_idx = rng.choice(samples[s2]['idx'].size)
 
         c1 = samples[s1]['idx'][c1_idx] + ((s1 + 1) / 10)
         c2 = samples[s2]['idx'][c2_idx] + ((s2 + 1) / 10)
@@ -465,9 +520,9 @@ def multiplex_looms(args):
         new_name = f'{samples[s1]["name"][c1_idx]}+{samples[s2]["name"][c2_idx]}'
 
         dbt_gt[new_id] = np.apply_along_axis(merge_gt, axis=1, arr=df[[c1, c2]])
-        dbt_GQ[new_id] = GQ[[c1,c2]].mean(axis=1)
-        dbt_DP[new_id] = (DP[[c1,c2]].mean(axis=1).round()).astype(int)
-        dbt_AD[new_id] = (AD[[c1,c2]].mean(axis=1).round()).astype(int)
+        dbt_GQ[new_id] = GQ[[c1, c2]].mean(axis=1)
+        dbt_DP[new_id] = (DP[[c1, c2]].mean(axis=1).round()).astype(int)
+        dbt_AD[new_id] = (AD[[c1, c2]].mean(axis=1).round()).astype(int)
         dbt_RO[new_id] = dbt_DP[new_id] - dbt_AD[new_id]
 
         samples[s1]['idx'] = np.delete(samples[s1]['idx'], c1_idx)
@@ -550,10 +605,10 @@ def multiplex_looms(args):
     cells = cells[keep_cells]
     cell_names = np.array(cell_names)[keep_cells]
     # Filter second time for variants present in >X percent of data
-    gt = gt[:,keep_cells]
-    AD = AD[:,keep_cells]
-    RO = RO[:,keep_cells]
-    VAF = VAF[:,keep_cells]
+    gt = gt[:, keep_cells]
+    AD = AD[:, keep_cells]
+    RO = RO[:, keep_cells]
+    VAF = VAF[:, keep_cells]
 
     if args.minMutated < 1:
         keep_var2 = np.mean((gt == 1) | (gt == 2), axis=1) >= args.minMutated
@@ -572,17 +627,17 @@ def multiplex_looms(args):
 
     meta_info = np.stack(np.char.split(index, '_'))
     variants_info = {
-        'CHR': meta_info[:,0],
-        'POS': meta_info[:,1].astype(int),
-        'REF': meta_info[:,2],
-        'ALT': meta_info[:,3],
+        'CHR': meta_info[:, 0],
+        'POS': meta_info[:, 1].astype(int),
+        'REF': meta_info[:, 2],
+        'ALT': meta_info[:, 3],
         'REGION': ampl,
         'NAME': ampl,
-        'FREQ': np.zeros(np.sum(keep_var))
+        'FREQ': np.zeros(np.sum(keep_var)),
     }
 
     for row, var_data in enumerate(gt):
-        for col, cell in enumerate(cells):
+        for col, _cell in enumerate(cells):
             name = cell_names[col]
             cell_str = f'{RO[row, col]}:{AD[row, col]}:{var_data[col]}'
             try:
@@ -594,11 +649,12 @@ def multiplex_looms(args):
 
 
 def process_loom(args, rel_cells=np.array([])):
+    """Retrieve data from loom file."""
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_in_file = os.path.join(temp_dir, os.path.basename(args.input[0]))
         shutil.copy2(args.input[0], temp_in_file)
         with loompy.connect(temp_in_file) as ds:
-            gt = ds[:,:]
+            gt = ds[:, :]
             if rel_cells.size > 0:
                 cell_names = ds.col_attrs['barcode']
                 cells = np.argwhere(np.isin(cell_names, rel_cells)).flatten()
@@ -611,7 +667,8 @@ def process_loom(args, rel_cells=np.array([])):
                     else:
                         subsample_size = min(int(args.cell_no * cell_no), cell_no)
                     print(f'Subsampling {subsample_size} cells')
-                    cells = np.random.choice(cell_no, size=subsample_size, replace=False)
+                    rng = np.random.default_rng()
+                    cells = rng.choice(cell_no, size=subsample_size, replace=False)
                     cells = np.sort(cells)
                 else:
                     cells = np.arange(cell_no)
@@ -634,10 +691,10 @@ def process_loom(args, rel_cells=np.array([])):
             gt = gt[mut_var]
             var_id = var_id_all[mut_var]
 
-            DP = ds.layers['DP'][mut_var,:][:,cells]
-            GQ = ds.layers['GQ'][mut_var,:][:,cells]
-            AD = ds.layers['AD'][mut_var,:][:,cells]
-            RO = ds.layers['RO'][mut_var,:][:,cells]
+            DP = ds.layers['DP'][mut_var, :][:, cells]
+            GQ = ds.layers['GQ'][mut_var, :][:, cells]
+            AD = ds.layers['AD'][mut_var, :][:, cells]
+            RO = ds.layers['RO'][mut_var, :][:, cells]
 
             # Filters 1-3: done second in mosaic
             # First filter: Remove genotype in cell with quality < X
@@ -650,13 +707,13 @@ def process_loom(args, rel_cells=np.array([])):
 
             del DP
             gc.collect()
-             # Fourth filter: Remove variants genotyped in < X % of cells; done last/fourth in mosaic
+            # Fourth filter: Remove variants genotyped in < X % of cells; done last/fourth in mosaic
             keep_var1 = np.mean(gt == 3, axis=1) < (1 - args.minVarGeno)
             # Fifth filter: Remove cells with < X %of genotypes present; done third in mosaic
             keep_cells = np.mean(gt[keep_var1] == 3, axis=0) < (1 - args.minCellGeno)
 
             # Filter second time for variants present in >X percent of data
-            gt = gt[:,keep_cells]
+            gt = gt[:, keep_cells]
             keep_var2 = np.mean((gt == 1) | (gt == 2), axis=1) > 0.01
             # Get only variants passing both filters
             keep_var = keep_var1 & keep_var2
@@ -665,12 +722,12 @@ def process_loom(args, rel_cells=np.array([])):
             keep_var[keep_var_wl] = True
             gt = gt[keep_var]
 
-            RO = RO[keep_var][:,keep_cells]
-            AD = AD[keep_var][:,keep_cells]
-            VAF = VAF[keep_var][:,keep_cells]
+            RO = RO[keep_var][:, keep_cells]
+            AD = AD[keep_var][:, keep_cells]
+            VAF = VAF[keep_var][:, keep_cells]
 
             ampl = ds.ra['amplicon'][mut_var][keep_var]
-            
+
             variants_info = {
                 'CHR': ds.ra['CHROM'][mut_var][keep_var],
                 'POS': ds.ra['POS'][mut_var][keep_var],
@@ -678,7 +735,7 @@ def process_loom(args, rel_cells=np.array([])):
                 'ALT': ds.ra['ALT'][mut_var][keep_var],
                 'REGION': ampl,
                 'NAME': ampl,
-                'FREQ': np.zeros(np.sum(keep_var))
+                'FREQ': np.zeros(np.sum(keep_var)),
             }
             cells = ds.col_attrs['barcode'][cells][keep_cells]
 
@@ -697,6 +754,7 @@ def process_loom(args, rel_cells=np.array([])):
 
 
 def update_whitelist(wl_file):
+    """Read in whitelist. Several input formats allowed."""
     df = pd.read_csv(wl_file, sep='\t')
 
     if df.size == 0:
@@ -709,7 +767,7 @@ def update_whitelist(wl_file):
     # Just 1 column: either wrong separator or direct whitelist entries
     elif df.shape[1] == 1:
         if re.match(r'[\dXY]{1,2}_\d+', df.columns[0]):
-            with open(wl_file, 'r') as f:
+            with open(wl_file) as f:
                 ids = f.read().strip().split('\n')
         else:
             df = pd.read_csv(wl_file, sep=',')
@@ -727,60 +785,156 @@ def update_whitelist(wl_file):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog='mosaic preprocessing',
-        usage='Single loom: python mosaic_preprocessing.py -i <DATA> [-args];' \
-            'Multiplexing: python mosaic_preprocessing.py -i <LOOM_1> <LOOM_2> ' \
-            '<LOOM_X> -R <RATIO_1> <RATIO_2> <RATIO_X> -d <DOUBLET_RATE>',
-        description='*** Filter a single loom file equal to MissionBio mosaic, ' \
-        'or multiplex n loom files synthetically and filter afterwards. ***')
-    parser.add_argument('-i', '--input', nargs='+', type=str,
-        help='Input loom file. If more given, multiplex snythetically.')
-    parser.add_argument('-a', '--assignment', type=str, default='',
-        help='Assignment of cells to clusters. Create output for each cluster.')
-    parser.add_argument('-wl', '--whitelist', type=str, default='',
-        help='Whitelist containing SNVs for plotting. Default = None.')
+    """Allows fine grained adjustment of variant filters, and determines to mode of this script. See docstrings for main."""
+    parser = argparse.ArgumentParser(
+        prog='mosaic preprocessing',
+        usage='Single loom: python mosaic_preprocessing.py -i <DATA> [-args];'
+        'Multiplexing: python mosaic_preprocessing.py -i <LOOM_1> <LOOM_2> '
+        '<LOOM_X> -R <RATIO_1> <RATIO_2> <RATIO_X> -d <DOUBLET_RATE>',
+        description='*** Filter a single loom file equal to MissionBio mosaic, '
+        'or multiplex n loom files synthetically and filter afterwards. ***',
+    )
+    parser.add_argument(
+        '-i',
+        '--input',
+        nargs='+',
+        type=str,
+        help='Input loom file. If more given, multiplex snythetically.',
+    )
+    parser.add_argument(
+        '-a',
+        '--assignment',
+        type=str,
+        default='',
+        help='Assignment of cells to clusters. Create output for each cluster.',
+    )
+    parser.add_argument(
+        '-wl',
+        '--whitelist',
+        type=str,
+        default='',
+        help='Whitelist containing SNVs for plotting. Default = None.',
+    )
     parser.add_argument('-o', '--output', type=str, help='Output file')
-    parser.add_argument('-fo', '--full_output', action='store_true',
-        help='Generate more output files (AD, RD, DP, full GT).')
+    parser.add_argument(
+        '-fo',
+        '--full_output',
+        action='store_true',
+        help='Generate more output files (AD, RD, DP, full GT).',
+    )
 
     multiplex = parser.add_argument_group('multiplex simulations')
-    multiplex.add_argument('-r', '--ratio', nargs='+', type=float,
-        help='Multiplex ratio (#arguments == #inputs).')
-    multiplex.add_argument('-d', '--doublets', type=float, default=0,
-        help='Fraction of doublet. Default = 0.')
-    multiplex.add_argument('-dp', '--depth', type=float, default=1,
-        help='Downsampling fraction. Default = 1 (i.e, no downsampling).')
+    multiplex.add_argument(
+        '-r',
+        '--ratio',
+        nargs='+',
+        type=float,
+        help='Multiplex ratio (#arguments == #inputs).',
+    )
+    multiplex.add_argument(
+        '-d',
+        '--doublets',
+        type=float,
+        default=0,
+        help='Fraction of doublet. Default = 0.',
+    )
+    multiplex.add_argument(
+        '-dp',
+        '--depth',
+        type=float,
+        default=1,
+        help='Downsampling fraction. Default = 1 (i.e, no downsampling).',
+    )
 
     downsample = parser.add_argument_group('downsample simulations')
-    downsample.add_argument('-c', '--cell_no', type=float, default=np.inf,
-        help='Downsample cells (either total number or fraction).' \
-            'Default = None')
+    downsample.add_argument(
+        '-c',
+        '--cell_no',
+        type=float,
+        default=np.inf,
+        help='Downsample cells (either total number or fraction).Default = None',
+    )
 
     mosaic = parser.add_argument_group('mosaic')
-    mosaic.add_argument('-mGQ', '--minGQ', type=int, default=30,
-        help='Minimum GQ to consider a variant (per cell).')
-    mosaic.add_argument('-mDP', '--minDP', type=int, default=10,
-        help='Minimum depth to consider a variant (per cell) .')
-    mosaic.add_argument('-mAF', '--minVAF', type=float, default=0.2,
-        help='Minimum alternate VAF to consider a variant (per cell).')
-    mosaic.add_argument('-mVG', '--minVarGeno', type=float, default=0.5,
-        help='Minimum fractions of genotyped loci to consider a variant.')
-    mosaic.add_argument('-mCG', '--minCellGeno', type=float, default=0.5,
-        help='Minimum fractions of genotyped cells to consider a cell.')
-    mosaic.add_argument('-mMut', '--minMutated', type=float, default=0.01,
-        help='Minimum fractions or cell number of het/hom cells to consider a variant.')
-    mosaic.add_argument('-refVAF', '--max_ref_VAF', type=float, default=0.05,
-        help='Maximum VAF to consider a wildtype variant (per cell).')
-    mosaic.add_argument('-homVAF', '--min_hom_VAF', type=float, default=0.95,
-        help='Minimum VAF to consider a homozygous variant (per cell).')
-    mosaic.add_argument('-hetVAF', '--min_het_VAF', type=float, default=0.35,
-        help='Minimum VAF to consider a heterozygous variant (per cell).')
-    mosaic.add_argument('-p', '--proximity', nargs='+', type=int,
-        default=[25, 50, 100, 200], help='If "i + 1" variants are within ' \
-            '"proximity[i]", then the variants are removed.')
-    mosaic.add_argument('-fs', '--filter_same', action='store_true',
-        help='Filter all but one variant on the same amplicon ' \
-            'if their genotypes are >95%% equal. Default = False')
+    mosaic.add_argument(
+        '-mGQ',
+        '--minGQ',
+        type=int,
+        default=30,
+        help='Minimum GQ to consider a variant (per cell).',
+    )
+    mosaic.add_argument(
+        '-mDP',
+        '--minDP',
+        type=int,
+        default=10,
+        help='Minimum depth to consider a variant (per cell) .',
+    )
+    mosaic.add_argument(
+        '-mAF',
+        '--minVAF',
+        type=float,
+        default=0.2,
+        help='Minimum alternate VAF to consider a variant (per cell).',
+    )
+    mosaic.add_argument(
+        '-mVG',
+        '--minVarGeno',
+        type=float,
+        default=0.5,
+        help='Minimum fractions of genotyped loci to consider a variant.',
+    )
+    mosaic.add_argument(
+        '-mCG',
+        '--minCellGeno',
+        type=float,
+        default=0.5,
+        help='Minimum fractions of genotyped cells to consider a cell.',
+    )
+    mosaic.add_argument(
+        '-mMut',
+        '--minMutated',
+        type=float,
+        default=0.01,
+        help='Minimum fractions or cell number of het/hom cells to consider a variant.',
+    )
+    mosaic.add_argument(
+        '-refVAF',
+        '--max_ref_VAF',
+        type=float,
+        default=0.05,
+        help='Maximum VAF to consider a wildtype variant (per cell).',
+    )
+    mosaic.add_argument(
+        '-homVAF',
+        '--min_hom_VAF',
+        type=float,
+        default=0.95,
+        help='Minimum VAF to consider a homozygous variant (per cell).',
+    )
+    mosaic.add_argument(
+        '-hetVAF',
+        '--min_het_VAF',
+        type=float,
+        default=0.35,
+        help='Minimum VAF to consider a heterozygous variant (per cell).',
+    )
+    mosaic.add_argument(
+        '-p',
+        '--proximity',
+        nargs='+',
+        type=int,
+        default=[25, 50, 100, 200],
+        help='If "i + 1" variants are within '
+        '"proximity[i]", then the variants are removed.',
+    )
+    mosaic.add_argument(
+        '-fs',
+        '--filter_same',
+        action='store_true',
+        help='Filter all but one variant on the same amplicon '
+        'if their genotypes are >95%% equal. Default = False',
+    )
 
     return parser.parse_args()
 

@@ -1,11 +1,18 @@
-# mutation_call_variability
+# DemoTape revision
 
-Investigating how mutation calls vary in single-cell DNA sequencing data as a
-function of cell count.
+Analyses carried out in response to the reviewers' comments on the **DemoTape**
+paper.
 
-## Background
+Aspects covered so far:
 
-This project addresses concerns raised in the revisions of **DemoTape**, regarding
+- **Mutation call variability** — how mutation calls in single-cell DNA
+  sequencing data vary as a function of cell count (see below).
+
+## Mutation call variability
+
+### Background
+
+This analysis addresses concerns raised in the revisions of **DemoTape**, regarding
 the claim that clonal structures and evolutionary patterns inferred from
 multiplexed data closely match those from individually sequenced samples.
 

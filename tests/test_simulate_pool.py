@@ -154,9 +154,9 @@ def test_unspecified_cells_and_doublet_rate_are_drawn_reproducibly(tmp_path):
     depth_source = tmp_path / 'depth.csv'
     np.savetxt(depth_source, np.full((3, 6), 40), fmt='%.0f', delimiter=',')
 
-    def run(name, seed):
+    def run(name, seed, n_same=1):
         args = types.SimpleNamespace(
-            n_same=1,
+            n_same=n_same,
             n_diff=1,
             cells_per_sample=None,
             doublet_rate=None,
@@ -175,6 +175,8 @@ def test_unspecified_cells_and_doublet_rate_are_drawn_reproducibly(tmp_path):
     assert 0.05 - 1e-3 <= doublet_rate <= 0.3 + 1e-3  # up to rounding of n_doublets
     assert run('b.csv', seed=1) == (singlets, doublet_rate)
     assert run('c.csv', seed=2) != (singlets, doublet_rate)
+    # The same seed with other site numbers gives independent draws.
+    assert run('d.csv', seed=1, n_same=2) != (singlets, doublet_rate)
 
 
 def test_het_params_are_valid_and_centred():

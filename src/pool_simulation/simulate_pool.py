@@ -287,7 +287,13 @@ def parse_args():
         required=True,
         help='Path to a depth matrix (from export_depth.py) to resample read depths from.',
     )
-    parser.add_argument('--seed', type=int, default=None, help='Random seed.')
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='Random seed; combined with n_same and n_diff, so that the same seed '
+        'gives independent pools for different site numbers.',
+    )
     parser.add_argument(
         '--output', type=str, required=True, help='Path to the output CSV file.'
     )
@@ -296,7 +302,10 @@ def parse_args():
 
 def main(args):
     """Simulate one pool and write it to `output`."""
-    rng = np.random.default_rng(args.seed)
+    # Seed with n_same and n_diff as well, so that the same seed gives independent
+    # draws (e.g. of cell numbers and doublet rate) for different site numbers.
+    seed = None if args.seed is None else [args.seed, args.n_same, args.n_diff]
+    rng = np.random.default_rng(seed)
     # Draw unspecified settings first, so that they are reproducible given the seed.
     cells_per_sample = args.cells_per_sample
     if cells_per_sample is None:

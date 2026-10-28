@@ -1,0 +1,9 @@
+# Conda environment for the pool simulation (src/pool_simulation/), as an
+# alternative to the pixi environment. Versions follow pixi.toml.
+name: pool_simulation
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy>=1.24
+  - polars>=0.20

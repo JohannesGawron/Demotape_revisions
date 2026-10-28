@@ -32,7 +32,7 @@ python = "==3.12.0"
 # Runtime - actually imported by src/mutation_call_variability
 numpy = ">=1.24"
 polars = ">=0.20"
-pandas = ">=2.0"
+pandas = ">=2.0,<3"  # <3: DemoTape (demultiplex_distance.py) uses DataFrame.applymap, removed in pandas 3
 loompy = ">=3.0.6"
 pyyaml = ">=6.0"
 pydantic = ">=2.0"
@@ -51,6 +51,9 @@ ipykernel = ">=6.0"    # Required for Quarto to find a Python kernel
 nbclient = ">=0.5"     # Required by quarto's jupyter engine to execute notebooks
 matplotlib = ">=3.7"
 seaborn = ">=0.12"
+scipy = ">=1.10"       # notebooks/read_model.qmd
+pymc = ">=5.10"        # notebooks/read_model.qmd
+arviz = ">=0.17"       # notebooks/read_model.qmd
 
 [pypi-dependencies]
 # Install the package itself in editable mode
@@ -96,8 +99,9 @@ snakemake-executor-plugin-slurm-jobstep = "<0.6.1"
 # Register Jupyter kernel for Quarto
 kernel = "python -m ipykernel install --user --name python3 --display-name 'Python 3 (mutation_call_variability)'"
 
-# Render Quarto notebooks
-regressions = { cmd = "quarto render notebooks/*.qmd", depends-on = ["kernel"] }
+# Render all Quarto notebooks; thanks to notebooks/_quarto.yml (freeze: auto),
+# only notebooks whose source changed are re-executed.
+notebooks = { cmd = "quarto render notebooks", depends-on = ["kernel"] }
 
 # Run tests
 test = "pytest tests/ -v"

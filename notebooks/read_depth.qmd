@@ -1,0 +1,448 @@
+---
+title: "Read depth model"
+subtitle: "How to simulate read depths realistically: a negative-binomial mixed model, its shortcomings, and resampling of real depths."
+author: "Johannes Gawron Wegner, CBG-ETH Zurich"
+date: "2026-10-20"
+format:
+  html:
+    code-fold: true
+    toc: true
+execute:
+  freeze: auto
+jupyter: python3
+---
+
+## Input data
+
+The input files are the `*.filtered_variants.csv` files of six Tapestri libraries (listed in `load_data.py`), each containing one patient. They contain the variants that passed the Mosaic filters. The columns are:
+
+- `CHR`, `POS`, `REF`, `ALT`, `REGION`, `NAME`, `FREQ`: variant information.
+- One column per cell barcode, with entries `RO:AD:GT`: reference read count, alternative read count, and the Mosaic genotype call (0 = wildtype, 1 = heterozygous, 2 = homozygous, 3 = missing).
+
+## Load data
+
+For each library, `load_data()` (in `load_data.py`, shared by the notebooks in this directory) returns three tables with variants as rows and cells as columns: the read depth (`RO + AD`), the alternative read count (`AD`) and the genotype call. Each table has a `variant` column (`CHR:POS:REF/ALT`) followed by one column per cell barcode. All three are built from the same input rows and columns, so rows and columns are in the same order and can be combined element-wise without worrying about mismatches.
+
+```{python}
+#| label: load-data
+#| echo: true
+
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
+from scipy import stats
+
+from load_data import load_data
+
+data = load_data()
+libraries = list(data)
+
+for b, (depth, alt, gt) in data.items():
+    assert depth.columns == alt.columns == gt.columns
+    assert depth['variant'].equals(alt['variant']) and depth['variant'].equals(gt['variant'])
+    print(f'{b}: {depth.height} variants x {depth.width - 1} cells')
+```
+
+## Read depth (negative binomial)
+
+We model the read depth of cell $c$ at locus $l$ as
+
+$$
+\begin{aligned}
+\text{depth}_{c,l} &\sim \text{NegBinom}(\mu_{c,l}, \phi) \\
+\log \mu_{c,l} &= u_c + \gamma_l \\
+u_c &\sim \text{Normal}(\beta_{\text{library}(c)}, \sigma) \\
+\beta_b &\sim \text{Normal}(\mu_\beta, \sigma_\beta),
+\end{aligned}
+$$
+
+i.e. a Gaussian cell effect whose mean is determined by the library, plus a locus (amplicon) effect. In this data, each library contains one patient, so patient and library effects cannot be separated. We attribute the differences to the library (sequencing run): in a multiplexed pool, all patients share one library, so the simulation should not model patient-specific depths. As every library has its own set of variants, the locus effects sum to zero within each library, so that $\beta_b$ is the mean log depth of library $b$ at an average locus. The library means themselves come from a common distribution with mean $\mu_\beta$ and run-to-run spread $\sigma_\beta$. To simulate a new pool, we draw its library mean from this distribution. With only six libraries, $\sigma_\beta$ is not well determined, and ADVI understates its uncertainty further.
+
+First, we bring the depths of all libraries into one long table.
+
+```{python}
+#| label: depth-long
+#| echo: true
+
+long = pl.concat(
+    depth.unpivot(index='variant', variable_name='cell', value_name='depth').with_columns(
+        pl.lit(p).alias('library')
+    )
+    for p, (depth, _, _) in data.items()
+)
+cell_means = long.group_by('library', 'cell', maintain_order=True).agg(
+    pl.col('depth').mean().alias('mean_depth')
+)
+```
+
+### Are the per-cell mean depths Gaussian?
+
+The model assumes the cell effects to be Gaussian on the log scale. As a first check, we look at Q-Q plots of the per-cell mean depth (over loci), on the linear and on the log scale.
+
+```{python}
+#| label: depth-gaussian-check
+#| echo: true
+
+fig, axes = plt.subplots(2, len(libraries), figsize=(3 * len(libraries), 6), squeeze=False)
+for j, p in enumerate(libraries):
+    mean_depth = cell_means.filter(pl.col('library') == p)['mean_depth'].to_numpy()
+    for i, (values, scale) in enumerate([(mean_depth, 'linear'), (np.log(mean_depth), 'log')]):
+        stats.probplot(values, dist='norm', plot=axes[i, j])
+        axes[i, j].set_title(f'{p}\n{scale} scale', fontsize=8)
+fig.tight_layout()
+plt.show()
+```
+
+### Fit the mixed model
+
+We fit the model with ADVI (variational inference), which is much faster than MCMC with this many cell effects. To keep it fast, we fit on a random subset of `N_CELLS_FIT` cells per library.
+
+```{python}
+#| label: depth-fit
+#| echo: true
+
+import arviz as az
+import pymc as pm
+import pytensor.tensor as pt
+
+N_CELLS_FIT = 500
+N_ADVI_STEPS = 15_000
+
+fit_cells = pl.concat(
+    cell_means.filter(pl.col('library') == p).sample(
+        n=min(N_CELLS_FIT, cell_means.filter(pl.col('library') == p).height), seed=0
+    )
+    for p in libraries
+).select('library', 'cell')
+fit = long.join(fit_cells, on=['library', 'cell'])
+
+# Integer codes: cells and loci are qualified by library; loci are ordered by
+# library, so that they match the concatenated per-library zero-sum effects.
+cell_keys, cell_idx = np.unique((fit['library'] + '/' + fit['cell']).to_numpy(), return_inverse=True)
+cell_library = np.array([libraries.index(k.split('/')[0]) for k in cell_keys])
+loci = [f'{p}/{v}' for p in libraries for v in data[p][0]['variant']]
+locus_idx = np.array([loci.index(k) for k in (fit['library'] + '/' + fit['variant']).to_numpy()])
+n_loci = [data[p][0].height for p in libraries]
+
+with pm.Model(coords={'library': libraries, 'cell': cell_keys}) as depth_model:
+    # Library means from a common distribution (non-centred, as there are only a
+    # few libraries); Gamma prior on the precision, as for the cell effects.
+    mu_beta = pm.Normal('mu_beta', mu=np.log(fit['depth'].mean()), sigma=1)
+    tau_beta = pm.Gamma('tau_beta', alpha=2, beta=0.1)
+    sigma_beta = pm.Deterministic('sigma_beta', 1 / pt.sqrt(tau_beta))
+    z_beta = pm.Normal('z_beta', mu=0, sigma=1, dims='library')
+    beta = pm.Deterministic('beta', mu_beta + sigma_beta * z_beta, dims='library')
+    # Gamma prior on the precision of the cell effects (conjugate to the Normal);
+    # mean alpha/beta = 20, i.e. sigma around 0.2, but broad.
+    tau = pm.Gamma('tau', alpha=2, beta=0.1)
+    sigma = pm.Deterministic('sigma', 1 / pt.sqrt(tau))
+    phi = pm.Exponential('phi', lam=0.1)
+
+    z = pm.Normal('z', mu=0, sigma=1, dims='cell')
+    u = pm.Deterministic('u', beta[cell_library] + sigma * z, dims='cell')
+    gamma = pt.concatenate(
+        [pm.ZeroSumNormal(f'gamma_{p}', sigma=1, shape=n) for p, n in zip(libraries, n_loci)]
+    )
+
+    pm.NegativeBinomial(
+        'depth', mu=pm.math.exp(u[cell_idx] + gamma[locus_idx]), alpha=phi,
+        observed=fit['depth'].to_numpy(),
+    )
+    # ADVI (mean-field variational inference) instead of MCMC: much faster, but
+    # it underestimates posterior uncertainty, so read the sds with care.
+    approx = pm.fit(n=N_ADVI_STEPS, method='advi', random_seed=0)
+    idata = approx.sample(1000, random_seed=0)
+    # Only one posterior draw is needed for the check below; predicting for all
+    # draws would need (draws x observations) integers, i.e. several GB.
+    ppc = pm.sample_posterior_predictive(idata.posterior.isel(draw=[-1]), random_seed=0)
+
+az.summary(idata, var_names=['mu_beta', 'sigma_beta', 'beta', 'sigma', 'phi'], kind='stats')
+```
+
+ADVI convergence: the loss (negative ELBO) should have flattened out by the last steps. If not, increase `N_ADVI_STEPS`.
+
+```{python}
+#| label: depth-advi-convergence
+#| echo: true
+
+fig, ax = plt.subplots(figsize=(6, 2.5))
+ax.plot(approx.hist)
+ax.set_yscale('log')
+ax.set_xlabel('ADVI step')
+ax.set_ylabel('loss (-ELBO)')
+fig.tight_layout()
+plt.show()
+```
+
+### Model checks
+
+Posterior predictive check: observed depths vs. depths simulated from the fitted model (one posterior draw), per library.
+
+```{python}
+#| label: depth-ppc
+#| echo: true
+
+observed = fit['depth'].to_numpy()
+predicted = ppc.posterior_predictive['depth'].isel(chain=0, draw=0).to_numpy()
+fit_library = fit['library'].to_numpy()
+
+fig, axes = plt.subplots(1, len(libraries), figsize=(3 * len(libraries), 2.5), squeeze=False)
+for ax, p in zip(axes[0], libraries):
+    bins = np.linspace(0, np.quantile(observed[fit_library == p], 0.99), 50)
+    ax.hist(observed[fit_library == p], bins=bins, alpha=0.5, density=True, label='observed')
+    ax.hist(predicted[fit_library == p], bins=bins, alpha=0.5, density=True, label='predicted')
+    ax.set_title(p, fontsize=8)
+    ax.set_xlabel('depth')
+axes[0, 0].legend(frameon=False)
+fig.tight_layout()
+plt.show()
+```
+
+Second Gaussianity check, now with the locus effects removed: Q-Q plots of the posterior mean cell effects $u_c$, per library.
+
+```{python}
+#| label: depth-cell-effects
+#| echo: true
+
+u_mean = idata.posterior['u'].mean(dim=('chain', 'draw')).to_numpy()
+
+fig, axes = plt.subplots(1, len(libraries), figsize=(3 * len(libraries), 3), squeeze=False)
+for j, (ax, p) in enumerate(zip(axes[0], libraries)):
+    stats.probplot(u_mean[cell_library == j], dist='norm', plot=ax)
+    ax.set_title(p, fontsize=8)
+fig.tight_layout()
+plt.show()
+```
+
+## Read depths for the simulator: resampling instead of a parametric model
+
+The posterior predictive check above shows that the negative binomial model does not reproduce the observed depth distribution: the observed depths have a sharp spike at about 50 reads and extra mass near 0, both missing in the model. Looking closer, these come from two features that a negative binomial (with cell and locus effects) cannot produce.
+
+1. **A cap at about 50 reads at many loci.** At a large part of the loci, a large fraction of cells has a depth of 48–52, and the depth at these loci varies far less than the negative binomial predicts; the most strongly capped loci come close to pure Poisson noise. This looks like a technical cap rather than biology. A likely candidate is GATK HaplotypeCaller's default downsampling (`--max-reads-per-alignment-start 50`): in amplicon data, all reads of an amplicon start at the same position, so well-covered amplicons are cut at about 50 reads. This hypothesis has not been verified against the pipeline configuration yet.
+2. **Excess low depths, concentrated in some cells and some loci** (dropout, e.g. a locus failing to amplify in a cell), i.e. a process separate from the sampling noise.
+
+The plot below shows the first point: per locus, the variance of the depth against its mean, coloured by the fraction of cells at 48–52 reads. A negative binomial predicts the variance to lie around the dashed line; the capped loci (yellow-green, mean depth about 50) lie far below it, the most strongly capped ones close to the Poisson line.
+
+```{python}
+#| label: depth-cap-diagnostics
+#| echo: true
+
+per_locus = long.group_by('library', 'variant').agg(
+    pl.col('depth').mean().alias('mean'),
+    pl.col('depth').var().alias('var'),
+    pl.col('depth').is_between(48, 52).mean().alias('frac_48_52'),
+    (pl.col('depth') < 5).mean().alias('frac_below_5'),
+)
+per_cell = long.group_by('library', 'cell').agg((pl.col('depth') < 5).mean().alias('frac_below_5'))
+
+phi_hat = float(idata.posterior['phi'].mean())
+m = np.linspace(per_locus['mean'].min(), per_locus['mean'].max(), 100)
+
+fig, ax = plt.subplots(figsize=(5, 4))
+points = ax.scatter(per_locus['mean'], per_locus['var'], c=per_locus['frac_48_52'], s=12, cmap='viridis')
+ax.plot(m, m, color='grey', label='Poisson (var = mean)')
+ax.plot(m, m + m**2 / phi_hat, color='grey', ls='--', label=f'negative binomial ($\\phi$ = {phi_hat:.1f})')
+ax.set_yscale('log')
+ax.set_xlabel('mean depth per locus')
+ax.set_ylabel('variance of depth per locus')
+ax.legend(frameon=False, fontsize=8)
+fig.colorbar(points, label='fraction of cells with depth 48–52')
+fig.tight_layout()
+plt.show()
+
+print(f"Loci with >= 30% of cells at 48-52 reads: {(per_locus['frac_48_52'] >= 0.3).sum()} of {per_locus.height}")
+print('Fraction of entries with depth < 5, quantiles (50%, 90%, 99%):')
+print('  per cell: ', np.quantile(per_cell['frac_below_5'], [0.5, 0.9, 0.99]).round(3))
+print('  per locus:', np.quantile(per_locus['frac_below_5'], [0.5, 0.9, 0.99]).round(3))
+```
+
+A parametric model would need a cap, a dropout component, and their dependence on cells and loci. For the simulator, we therefore **resample real depths** instead (`src/pool_simulation/simulate_pool.py`): each pool uses one real library; each simulated site takes the depths of a real locus of that library (among those passing the Mosaic depth filter), and each simulated cell those of a real cell. Doublets get the rounded mean of two real cells. This keeps the cap, the dropout, the cell and locus effects, and how they combine, exactly as in the data, without a model that could get them wrong. The alt read counts are still simulated from the depths.
+
+### Check: are resampled depths more realistic?
+
+For each library, we simulate a pool from that library's depths (singlets only, i.e. no doublets, to compare like with like) and compare its depth distribution with the observed depths and the negative binomial model's prediction from above. As the simulator copies real depths, the resampled distribution should match the observed one closely; differences come only from resampling cells and loci with replacement and from keeping only loci that pass the depth filter.
+
+```{python}
+#| label: depth-resampling-check
+#| echo: true
+
+from pool_simulation.simulate_pool import simulate_pool
+
+sim_rng = np.random.default_rng(0)
+resampled = {}
+for b in libraries:
+    real_depth = data[b][0].drop('variant').to_numpy()
+    ref, alt, _ = simulate_pool(30, 30, [500, 500, 500], 0.0, real_depth, sim_rng)
+    resampled[b] = (ref + alt).ravel()
+
+sources = {
+    b: {
+        'observed': observed[fit_library == b],
+        'NB model': predicted[fit_library == b],
+        'resampled': resampled[b],
+    }
+    for b in libraries
+}
+
+fig, axes = plt.subplots(1, len(libraries), figsize=(3 * len(libraries), 2.5), squeeze=False)
+for ax, b in zip(axes[0], libraries):
+    bins = np.arange(0, np.quantile(sources[b]['observed'], 0.99) + 2, 2)
+    for name, depths in sources[b].items():
+        ax.hist(depths, bins=bins, density=True, histtype='step', label=name)
+    ax.set_title(b, fontsize=8)
+    ax.set_xlabel('depth')
+axes[0, 0].legend(frameon=False, fontsize=8)
+fig.tight_layout()
+plt.show()
+
+pl.DataFrame(
+    [
+        {
+            'library': b,
+            'source': name,
+            'depth < 10': (depths < 10).mean(),
+            'depth 48-52': ((depths >= 48) & (depths <= 52)).mean(),
+            'depth > 100': (depths > 100).mean(),
+        }
+        for b in libraries
+        for name, depths in sources[b].items()
+    ]
+).with_columns(pl.col(pl.Float64).round(3))
+```
+
+## Do the libraries need separate treatment?
+
+The simulator draws all depths of a pool from one real library. That part is structural, not a modelling choice: cells and loci differ between libraries, so mixing libraries would give a simulated cell the depths of unrelated real cells at different sites and lose the cell-level structure (cell effect, cell-level dropout). It is also realistic, as all patients of a multiplexed pool share one library. The question here is whether the *choice* of library matters, i.e. whether results have to be reported per depth source, or whether the source library can simply be drawn at random per simulated pool.
+
+### Variance components
+
+From the mixed model: how much the depth varies between libraries (run to run), between cells within a library, and between entries (negative binomial noise at a typical depth $e^{\mu_\beta}$). For comparison, each standard deviation on the log scale is also given as a relative standard deviation of the depth ($\sqrt{e^{s^2} - 1}$ for a log-scale sd $s$, and the coefficient of variation $\sqrt{1/\mu + 1/\phi}$ for the negative binomial).
+
+```{python}
+#| label: library-variance-components
+#| echo: true
+
+post = idata.posterior.mean(dim=('chain', 'draw'))
+mu_typical = np.exp(float(post['mu_beta']))
+nb_cv = np.sqrt(1 / mu_typical + 1 / float(post['phi']))
+
+pl.DataFrame(
+    [
+        {'level': 'library (run to run)', 'sd (log scale)': float(post['sigma_beta'])},
+        {'level': 'cell within library', 'sd (log scale)': float(post['sigma'])},
+        {'level': f'entry (NB noise at depth {mu_typical:.0f})', 'sd (log scale)': np.sqrt(np.log1p(nb_cv**2))},
+    ]
+).with_columns(
+    (pl.col('sd (log scale)') ** 2).exp().sub(1).sqrt().alias('relative sd of depth')
+).with_columns(pl.col(pl.Float64).round(3))
+```
+
+### Depth features per library
+
+The resampler copies the features the negative binomial misses, so these should be compared between libraries too, not only the mean: the number of loci that pass the Mosaic depth filter (the pool of loci the simulator draws from), the fraction of capped loci (≥ 30% of cells at 48–52 reads), and dropout (fraction of entries with depth < 5) per locus and per cell. All statistics except `loci` are computed on the passing loci only, as the simulator uses only these.
+
+```{python}
+#| label: library-features
+#| echo: true
+
+from pool_simulation.simulate_pool import MIN_DEPTH, MIN_GENOTYPED_FRACTION
+
+locus_features = long.group_by('library', 'variant').agg(
+    ((pl.col('depth') >= MIN_DEPTH).mean() >= MIN_GENOTYPED_FRACTION).alias('passes'),
+    pl.col('depth').is_between(48, 52).mean().alias('frac_48_52'),
+    (pl.col('depth') < 5).mean().alias('frac_below_5'),
+)
+long_passing = long.join(
+    locus_features.filter(pl.col('passes')).select('library', 'variant'), on=['library', 'variant']
+)
+cell_features = long_passing.group_by('library', 'cell').agg(
+    pl.col('depth').mean().alias('mean_depth'),
+    (pl.col('depth') < 5).mean().alias('frac_below_5'),
+)
+
+rows = []
+for b in libraries:
+    loc = locus_features.filter(pl.col('library') == b)
+    ok = loc.filter(pl.col('passes'))
+    cells = cell_features.filter(pl.col('library') == b)
+    rows.append(
+        {
+            'library': b,
+            'cells': cells.height,
+            'loci': loc.height,
+            'loci passing': ok.height,
+            'median depth': long_passing.filter(pl.col('library') == b)['depth'].median(),
+            'capped loci': (ok['frac_48_52'] >= 0.3).mean(),
+            'locus dropout (median)': ok['frac_below_5'].median(),
+            'locus dropout (90%)': ok['frac_below_5'].quantile(0.9),
+            'cell dropout (median)': cells['frac_below_5'].median(),
+            'cell dropout (90%)': cells['frac_below_5'].quantile(0.9),
+        }
+    )
+pl.DataFrame(rows).with_columns(pl.col(pl.Float64).round(3))
+```
+
+The same comparison as distributions: the depths of all entries at passing loci, and the per-cell mean depths (the cell effects, on a log axis), one line per library.
+
+```{python}
+#| label: library-distributions
+#| echo: true
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+depth_bins = np.arange(0, np.quantile(long_passing['depth'], 0.99) + 2, 2)
+cell_bins = np.geomspace(1, cell_features['mean_depth'].max(), 50)
+for b in libraries:
+    axes[0].hist(
+        long_passing.filter(pl.col('library') == b)['depth'],
+        bins=depth_bins, density=True, histtype='step', label=b,
+    )
+    axes[1].hist(
+        cell_features.filter(pl.col('library') == b)['mean_depth'],
+        bins=cell_bins, density=True, histtype='step',
+    )
+axes[0].set_xlabel('depth (entries at passing loci)')
+axes[1].set_xlabel('mean depth per cell')
+axes[1].set_xscale('log')
+axes[0].legend(frameon=False, fontsize=7)
+fig.tight_layout()
+plt.show()
+```
+
+### Check: simulating from the stacked GFB libraries
+
+The simulator ships with one depth matrix built from the three GFB libraries by `export_depth.py`. The libraries are stacked block by block (`nan` where a cell's library lacks a locus) and anonymised. Each simulated cell gets one real cell per library, so the cell effect and the cell-level dropout are consistent within a library's loci but not across libraries. Here we stack the three libraries in the same way, simulate a pool (singlets only), and compare it with the observed depths of the three libraries: the depth distribution, and the per-cell dropout (fraction of sites with depth < 5). The per-cell dropout is where mixing cells across libraries would show, as a narrower distribution.
+
+```{python}
+#| label: library-stacked-check
+#| echo: true
+
+from pool_simulation.export_depth import stack_blocks
+
+GFB = ['GFB-4395_GFB-4399', 'GFB-4396_GFB-4400', 'GFB-4397_GFB-4401']
+stacked = stack_blocks(
+    [data[b][0].drop('variant').to_numpy() for b in GFB], np.random.default_rng(0)
+)
+ref, alt, _ = simulate_pool(30, 30, [500, 500, 500], 0.0, stacked, np.random.default_rng(0))
+stacked_depth = ref + alt
+gfb_depth = long_passing.filter(pl.col('library').is_in(GFB))['depth']
+gfb_dropout = cell_features.filter(pl.col('library').is_in(GFB))['frac_below_5']
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+depth_bins = np.arange(0, np.quantile(gfb_depth, 0.99) + 2, 2)
+dropout_bins = np.linspace(0, max(gfb_dropout.max(), (stacked_depth < 5).mean(axis=0).max()), 30)
+axes[0].hist(gfb_depth, bins=depth_bins, density=True, histtype='step', label='observed (GFB)')
+axes[0].hist(stacked_depth.ravel(), bins=depth_bins, density=True, histtype='step', label='simulated (stacked)')
+axes[1].hist(gfb_dropout, bins=dropout_bins, density=True, histtype='step')
+axes[1].hist((stacked_depth < 5).mean(axis=0), bins=dropout_bins, density=True, histtype='step')
+axes[0].set_xlabel('depth')
+axes[1].set_xlabel('fraction of sites with depth < 5, per cell')
+axes[0].legend(frameon=False, fontsize=8)
+fig.tight_layout()
+plt.show()
+```
+
+### Conclusion
+
+The library-to-library spread of the mean depth ($\sigma_\beta$) is about half the cell-to-cell spread and small compared with the per-entry noise, so the mean depth gives no reason to treat libraries separately. The simulator therefore samples from one matrix that stacks the three GFB libraries, without modelling library effects. Check that the depth features in the table above are similar between the GFB libraries, and that the stacked simulation reproduces the observed depths and per-cell dropout.
+
+A downstream check is still open: simulating pools with different depth sources, keeping all else fixed, and comparing DemoTape's accuracy.

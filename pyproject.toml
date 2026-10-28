@@ -42,7 +42,7 @@ dynamic = ["version"]
 dependencies = [
     "numpy>=1.24",
     "polars>=0.20",
-    "pandas>=2.0",
+    "pandas>=2.0,<3",
     "loompy>=3.0.6",
     "pyyaml>=6.0",
     "pydantic>=2.0",
@@ -105,7 +105,7 @@ include = [
 
 [tool.hatch.build.targets.wheel]
 # Package only the src directory
-packages = ["src/mutation_call_variability"]
+packages = ["src/mutation_call_variability", "src/pool_simulation"]
 
 # =============================================================================
 # Ruff - Fast Python linter and formatter (replaces black, flake8, isort)

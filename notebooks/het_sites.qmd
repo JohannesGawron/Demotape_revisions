@@ -1,0 +1,355 @@
+---
+title: "Heterozygous sites"
+subtitle: "A beta-binomial mixture with allelic dropout for the alt read counts at heterozygous sites."
+author: "Johannes Gawron Wegner, CBG-ETH Zurich"
+date: "2026-10-20"
+format:
+  html:
+    code-fold: true
+    toc: true
+execute:
+  freeze: auto
+jupyter: python3
+---
+
+## Input data
+
+The input files are the `*.filtered_variants.csv` files of six Tapestri libraries (listed in `load_data.py`), each containing one patient. They contain the variants that passed the Mosaic filters. The columns are:
+
+- `CHR`, `POS`, `REF`, `ALT`, `REGION`, `NAME`, `FREQ`: variant information.
+- One column per cell barcode, with entries `RO:AD:GT`: reference read count, alternative read count, and the Mosaic genotype call (0 = wildtype, 1 = heterozygous, 2 = homozygous, 3 = missing).
+
+## Load data
+
+For each library, `load_data()` (in `load_data.py`, shared by the notebooks in this directory) returns three tables with variants as rows and cells as columns: the read depth (`RO + AD`), the alternative read count (`AD`) and the genotype call. Each table has a `variant` column (`CHR:POS:REF/ALT`) followed by one column per cell barcode. All three are built from the same input rows and columns, so rows and columns are in the same order and can be combined element-wise without worrying about mismatches.
+
+```{python}
+#| label: load-data
+#| echo: true
+
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
+from scipy import stats
+
+from load_data import load_data
+
+data = load_data()
+libraries = list(data)
+
+for b, (depth, alt, gt) in data.items():
+    assert depth.columns == alt.columns == gt.columns
+    assert depth['variant'].equals(alt['variant']) and depth['variant'].equals(gt['variant'])
+    print(f'{b}: {depth.height} variants x {depth.width - 1} cells')
+```
+
+## Heterozygous sites (beta-binomial)
+
+At a heterozygous site, the alt read count of a cell is modelled as a mixture of a beta-binomial (both alleles amplified) and allelic dropout (one allele lost, so all reads come from the other one, up to the error rate $\varepsilon$):
+
+$$
+\text{alt} \sim (1 - d) \cdot \text{BetaBin}(\text{depth}, m\kappa, (1 - m)\kappa) + \frac{d}{2} \cdot \text{Binom}(\text{depth}, \varepsilon) + \frac{d}{2} \cdot \text{Binom}(\text{depth}, 1 - \varepsilon),
+$$
+
+with dropout rate $d$, beta-binomial mean $m$ (expected VAF) and concentration $\kappa$ (larger means less overdispersed), and the false genotyping error rate $\varepsilon$. Both alleles are assumed to drop out with the same probability. The parameters are estimated by maximum likelihood.
+
+### Germline heterozygous sites
+
+A locus counts as germline heterozygous in a library if
+
+1. at least 80% of its called cells (genotype ≠ 3) are called heterozygous, and
+2. its VAF distribution is roughly symmetric around 0.5: the median VAF over cells with depth ≥ 10 lies within `0.5 ± MAX_MEDIAN_VAF_OFFSET`. The median is robust to the dropout modes at 0 and 1.
+
+We use all cells with depth ≥ 1 at these loci. Note that the second criterion favours loci with a mean VAF near 0.5, so the estimate of $m$ is not independent of this selection.
+
+```{python}
+#| label: het-data
+#| echo: true
+
+from scipy import optimize, special
+
+MAX_MEDIAN_VAF_OFFSET = 0.1
+
+het = {}
+for b, (depth, alt, gt) in data.items():
+    depth_b, alt_b, gt_b = (t.drop('variant').to_numpy() for t in (depth, alt, gt))
+    called = gt_b != 3
+    mostly_het = ((gt_b == 1) & called).sum(axis=1) / called.sum(axis=1) >= 0.8
+    vaf = np.where(depth_b >= 10, alt_b / np.maximum(depth_b, 1), np.nan)
+    symmetric = np.abs(np.nanmedian(vaf, axis=1) - 0.5) <= MAX_MEDIAN_VAF_OFFSET
+    het_loci = mostly_het & symmetric
+    print(f'{b}: {mostly_het.sum()} mostly-het loci, {(mostly_het & ~symmetric).sum()} excluded as asymmetric')
+    locus, cell = np.nonzero(het_loci[:, None] & (depth_b >= 1))
+    het[b] = {
+        'depth': depth_b[locus, cell],
+        'alt': alt_b[locus, cell],
+        'locus': np.unique(locus, return_inverse=True)[1],  # 0, ..., n_loci - 1
+        'n_loci': int(het_loci.sum()),
+    }
+    print(f"{b}: {het[b]['n_loci']} het loci, {len(locus)} observations")
+```
+
+### Maximum-likelihood fit
+
+`fit_mixture` fits $m$ and $\kappa$ per locus (or shared, with `n_loci=1`), and $d$ and $\varepsilon$ shared across loci. The parameters are optimised on an unconstrained scale.
+
+```{python}
+#| label: het-fit
+#| echo: true
+
+
+def mixture_loglik(alt, depth, m, kappa, d, eps):
+    """Per-observation log-likelihood of the beta-binomial/dropout mixture."""
+    return special.logsumexp(
+        [
+            np.log1p(-d) + stats.betabinom.logpmf(alt, depth, m * kappa, (1 - m) * kappa),
+            np.log(d / 2) + stats.binom.logpmf(alt, depth, eps),
+            np.log(d / 2) + stats.binom.logpmf(alt, depth, 1 - eps),
+        ],
+        axis=0,
+    )
+
+
+def unpack(theta, n_loci):
+    """Map unconstrained parameters to (m, kappa, d, eps); eps is kept below 0.5."""
+    m = special.expit(theta[:n_loci])
+    kappa = np.exp(theta[n_loci : 2 * n_loci])
+    return m, kappa, special.expit(theta[-2]), special.expit(theta[-1]) / 2
+
+
+def fit_mixture(alt, depth, locus, n_loci):
+    """Maximum-likelihood fit; returns the optimiser result and (m, kappa, d, eps)."""
+
+    def neg_loglik(theta):
+        m, kappa, d, eps = unpack(theta, n_loci)
+        return -mixture_loglik(alt, depth, m[locus], kappa[locus], d, eps).sum()
+
+    theta0 = np.concatenate(
+        [np.zeros(n_loci), np.full(n_loci, np.log(20)), [special.logit(0.05), special.logit(0.02)]]
+    )
+    res = optimize.minimize(neg_loglik, theta0, method='L-BFGS-B')
+    assert res.success, res.message
+    return res, unpack(res.x, n_loci)
+
+
+shared = {
+    b: fit_mixture(h['alt'], h['depth'], np.zeros_like(h['locus']), 1) for b, h in het.items()
+}
+
+pl.DataFrame(
+    [
+        {'library': b, 'm': m[0], 'kappa': kappa[0], 'dropout d': d, 'error eps': eps}
+        for b, (_, (m, kappa, d, eps)) in shared.items()
+    ]
+).with_columns(pl.col(pl.Float64).round(4))
+```
+
+### Goodness of fit
+
+We simulate alt counts from the fitted shared model at the observed depths and compare the VAF distributions (cells with depth ≥ 10). The simulated distribution should reproduce both the central hump and the dropout modes at 0 and 1.
+
+```{python}
+#| label: het-gof
+#| echo: true
+
+het_rng = np.random.default_rng(0)
+
+fig, axes = plt.subplots(1, len(libraries), figsize=(3 * len(libraries), 2.5), squeeze=False)
+for ax, b in zip(axes[0], libraries):
+    h = het[b]
+    _, (m, kappa, d, eps) = shared[b]
+    n = len(h['depth'])
+    p = np.where(
+        het_rng.random(n) < d,
+        np.where(het_rng.random(n) < 0.5, eps, 1 - eps),  # dropout of either allele
+        het_rng.beta(m[0] * kappa[0], (1 - m[0]) * kappa[0], n),
+    )
+    alt_sim = het_rng.binomial(h['depth'], p)
+
+    keep = h['depth'] >= 10
+    bins = np.linspace(0, 1, 41)
+    ax.hist(h['alt'][keep] / h['depth'][keep], bins=bins, density=True, histtype='step', label='observed')
+    ax.hist(alt_sim[keep] / h['depth'][keep], bins=bins, density=True, histtype='step', label='fitted model')
+    ax.set_title(b, fontsize=8)
+    ax.set_xlabel('VAF')
+axes[0, 0].legend(frameon=False, fontsize=8)
+fig.tight_layout()
+plt.show()
+```
+
+### Do the parameters depend on the locus?
+
+We compare three nested models:
+
+- **shared**: one $m$, $\kappa$, $d$ and $\varepsilon$ for all loci of a library (4 parameters),
+- **m, κ per locus**: own $m$ and $\kappa$ per locus, shared $d$ and $\varepsilon$ ($2L + 2$ parameters for $L$ loci),
+- **all per locus**: all four parameters per locus ($4L$ parameters). Here the likelihood factorises over loci, so we fit each locus separately.
+
+Two likelihood-ratio tests answer the two questions: *m, κ per locus* vs. *shared* tests whether the beta-binomial parameters depend on the locus; *all per locus* vs. *m, κ per locus* tests whether, in addition, dropout rate and error rate depend on the locus. Both have $2(L - 1)$ degrees of freedom. With thousands of cells per locus, these tests detect even small differences, so read them together with AIC and the plots of the per-locus estimates below.
+
+```{python}
+#| label: het-locus
+#| echo: true
+
+
+def fit_each_locus(h):
+    """Fit all four parameters separately for each locus; return the summed negative log-likelihood and (m, kappa, d, eps) per locus."""
+    fits = [
+        fit_mixture(
+            h['alt'][h['locus'] == l], h['depth'][h['locus'] == l], np.zeros((h['locus'] == l).sum(), dtype=int), 1
+        )
+        for l in range(h['n_loci'])
+    ]
+    params = tuple(np.array([np.ravel(q[i])[0] for _, q in fits]) for i in range(4))
+    return sum(res.fun for res, _ in fits), params
+
+
+per_locus_fit = {b: fit_mixture(h['alt'], h['depth'], h['locus'], h['n_loci']) for b, h in het.items()}
+each_locus_fit = {b: fit_each_locus(h) for b, h in het.items()}
+
+rows = []
+for b, h in het.items():
+    n_loci = h['n_loci']
+    nll = {
+        'shared': shared[b][0].fun,
+        'm, kappa per locus': per_locus_fit[b][0].fun,
+        'all per locus': each_locus_fit[b][0],
+    }
+    n_params = {'shared': 4, 'm, kappa per locus': 2 * n_loci + 2, 'all per locus': 4 * n_loci}
+    df = 2 * (n_loci - 1)
+    lr_m_kappa = 2 * (nll['shared'] - nll['m, kappa per locus'])
+    lr_d_eps = 2 * (nll['m, kappa per locus'] - nll['all per locus'])
+    rows.append(
+        {
+            'library': b,
+            'n_loci': n_loci,
+            **{f'AIC {name}': 2 * n_params[name] + 2 * value for name, value in nll.items()},
+            'df': df,
+            'LR m, kappa': lr_m_kappa,
+            'p m, kappa': stats.chi2.sf(lr_m_kappa, df),
+            'LR d, eps': lr_d_eps,
+            'p d, eps': stats.chi2.sf(lr_d_eps, df),
+        }
+    )
+display(pl.DataFrame(rows).with_columns(pl.col(pl.Float64).round(4)))
+
+fig, axes = plt.subplots(4, len(libraries), figsize=(3 * len(libraries), 9), squeeze=False)
+for j, b in enumerate(libraries):
+    _, per_locus_values = each_locus_fit[b]
+    _, (m, kappa, d, eps) = shared[b]
+    for i, (values, shared_value, name) in enumerate(
+        zip(per_locus_values, [m[0], kappa[0], d, eps], ['m', 'kappa', 'dropout d', 'error eps'])
+    ):
+        axes[i, j].plot(values, 'o')
+        axes[i, j].axhline(shared_value, color='grey', ls='--')
+        axes[i, j].set_xlabel('locus')
+        axes[i, j].set_ylabel(name)
+    axes[0, j].set_title(b, fontsize=8)
+fig.suptitle('Per-locus estimates (all parameters per locus); dashed: shared estimate')
+fig.tight_layout()
+plt.show()
+```
+
+## Per-locus parameter distribution
+
+For the simulator, each simulated heterozygous site gets its own parameters $(m, \kappa, d, \varepsilon)$, drawn from a distribution fitted to the per-locus estimates above (all parameters per locus), pooled over all libraries. On an unconstrained scale (logit $m$, log $\kappa$, logit $d$, logit $2\varepsilon$, as $\varepsilon < 0.5$), we fit one independent Gaussian per parameter. Every draw is then a valid parameter set.
+
+The spread of the per-locus estimates includes their estimation noise. With thousands of cells per locus it is small for $m$, $\kappa$ and $d$; $\varepsilon$ is determined only by the dropout cells, so at loci with little dropout it is noisy, and its sd may be inflated.
+
+```{python}
+#| label: het-param-distribution
+#| echo: true
+
+PARAM_NAMES = ['logit m', 'log kappa', 'logit d', 'logit 2 eps']
+
+m_l, kappa_l, d_l, eps_l = (
+    np.concatenate([each_locus_fit[b][1][i] for b in libraries]) for i in range(4)
+)
+transformed = np.column_stack(
+    [special.logit(m_l), np.log(kappa_l), special.logit(d_l), special.logit(2 * eps_l)]
+)
+het_mean = transformed.mean(axis=0)
+het_sd = transformed.std(axis=0, ddof=1)
+
+fig, axes = plt.subplots(1, 4, figsize=(12, 2.5))
+for i, ax in enumerate(axes):
+    ax.hist(transformed[:, i], bins=15, density=True, histtype='step', label='per-locus estimates')
+    x = np.linspace(transformed[:, i].min() - het_sd[i], transformed[:, i].max() + het_sd[i], 200)
+    ax.plot(x, stats.norm.pdf(x, het_mean[i], het_sd[i]), color='grey', ls='--', label='Gaussian')
+    ax.set_xlabel(PARAM_NAMES[i])
+axes[0].legend(frameon=False, fontsize=8)
+fig.tight_layout()
+plt.show()
+
+print(f'{len(transformed)} het loci')
+display(
+    pl.DataFrame({'': PARAM_NAMES, **dict(zip(PARAM_NAMES, np.corrcoef(transformed.T)))}).with_columns(
+        pl.col(pl.Float64).round(2)
+    )
+)
+print('Constants for src/pool_simulation/simulate_pool.py:')
+print(f'HET_MEAN = np.array({np.round(het_mean, 3).tolist()})')
+print(f'HET_SD = np.array({np.round(het_sd, 3).tolist()})')
+```
+
+The correlation matrix shows whether drawing the parameters independently is acceptable: large correlations (say $|r| > 0.5$) would be lost by the simulator.
+
+### Check: simulating from the per-locus distribution
+
+We draw a parameter set per het locus from the Gaussians, simulate alt counts at the observed depths, and compare with the observed data and with the shared fits, pooled over all libraries (cells with depth ≥ 10). Left: the VAF distribution. Right: the spread between loci, as the per-locus fraction of cells in the dropout modes (VAF < 0.1 or > 0.9). The shared fits give every locus the same dropout rate, so they should underestimate this spread; the per-locus draws should reproduce it.
+
+```{python}
+#| label: het-param-check
+#| echo: true
+
+
+def simulate_alt(depth, m, kappa, d, eps, rng):
+    """Alt counts from the mixture, with parameters per observation."""
+    n = len(depth)
+    p = np.where(
+        rng.random(n) < d,
+        np.where(rng.random(n) < 0.5, eps, 1 - eps),
+        rng.beta(m * kappa, (1 - m) * kappa, n),
+    )
+    return rng.binomial(depth, p)
+
+
+check_rng = np.random.default_rng(0)
+vaf = {'observed': [], 'shared fit': [], 'per-locus Gaussians': []}
+dropout_frac = {name: [] for name in vaf}
+for b, h in het.items():
+    keep = h['depth'] >= 10
+    _, (m, kappa, d, eps) = shared[b]
+    draws = check_rng.normal(het_mean, het_sd, (h['n_loci'], 4))
+    locus_params = (
+        special.expit(draws[:, 0]),
+        np.exp(draws[:, 1]),
+        special.expit(draws[:, 2]),
+        special.expit(draws[:, 3]) / 2,
+    )
+    alts = {
+        'observed': h['alt'],
+        'shared fit': simulate_alt(h['depth'], m[0], kappa[0], d, eps, check_rng),
+        'per-locus Gaussians': simulate_alt(
+            h['depth'], *(q[h['locus']] for q in locus_params), check_rng
+        ),
+    }
+    for name, alt in alts.items():
+        v = alt[keep] / h['depth'][keep]
+        vaf[name].append(v)
+        locus = h['locus'][keep]
+        in_dropout = (v < 0.1) | (v > 0.9)
+        dropout_frac[name].extend(in_dropout[locus == l].mean() for l in range(h['n_loci']))
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+for name in vaf:
+    axes[0].hist(np.concatenate(vaf[name]), bins=np.linspace(0, 1, 41), density=True, histtype='step', label=name)
+    axes[1].hist(dropout_frac[name], bins=np.linspace(0, max(map(max, dropout_frac.values())), 20), density=True, histtype='step')
+axes[0].set_xlabel('VAF')
+axes[1].set_xlabel('fraction of cells with VAF < 0.1 or > 0.9, per locus')
+axes[0].legend(frameon=False, fontsize=8)
+fig.tight_layout()
+plt.show()
+```
+
+## Dropout and error rates

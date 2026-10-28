@@ -1,0 +1,84 @@
+'''Snakemake workflow to benchmark DemoTape on simulated pools.
+
+For every combination of n_same and n_diff (config.yaml), and every seed, a pool
+of three patients is simulated, demultiplexed with DemoTape, and scored by the
+adjusted Rand index (ARI) of pat1 vs. pat2. The ARIs are plotted as a grid of
+boxplots (rows: n_same, columns: n_diff).
+
+Usage (from the repository root):
+    pixi run pool-grid-dry   # dry run: show what would be executed
+    pixi run pool-grid       # submit rules as SLURM jobs
+'''
+
+from pathlib import Path
+
+
+configfile: 'workflow/pool_simulation/config.yaml'
+
+
+OUT = Path(config['output_directory'])
+POOL = 'same{n_same}_diff{n_diff}_seed{seed}'
+
+
+wildcard_constraints:
+    n_same=r'\d+',
+    n_diff=r'\d+',
+    seed=r'\d+',
+
+
+rule all:
+    input:
+        OUT / 'ari_grid.png',
+
+
+rule simulate_pool:
+    input:
+        config['depth_source'],
+    output:
+        OUT / 'pools' / f'{POOL}.csv',
+    resources:
+        mem_mb_per_cpu=4096,
+        runtime=30,
+    shell:
+        'python -m pool_simulation.simulate_pool'
+        ' --n_same {wildcards.n_same} --n_diff {wildcards.n_diff}'
+        ' --depth_source {input} --seed {wildcards.seed} --output {output}'
+
+
+rule demultiplex:
+    input:
+        rules.simulate_pool.output,
+    output:
+        assignments=OUT / 'demultiplexed' / f'{POOL}.assignments.tsv',
+        profiles=OUT / 'demultiplexed' / f'{POOL}.profiles.tsv',
+    params:
+        # DemoTape appends .assignments.tsv and .profiles.tsv to this base name.
+        base=lambda wildcards, output: output.assignments.removesuffix('.assignments.tsv'),
+    resources:
+        mem_mb_per_cpu=4096,
+        runtime=90,
+    shell:
+        'python {config[demotape_script]} --input {input} -n 3 --output {params.base}'
+
+
+rule evaluate:
+    input:
+        expand(
+            str(OUT / 'demultiplexed' / f'{POOL}.assignments.tsv'),
+            n_same=config['n_same'],
+            n_diff=config['n_diff'],
+            seed=range(config['seeds']),
+        ),
+    output:
+        OUT / 'ari.tsv',
+    shell:
+        'python -m pool_simulation.evaluate_demultiplexing --assignments {input} --output {output}'
+
+
+rule plot:
+    input:
+        rules.evaluate.output,
+    output:
+        OUT / 'ari_grid.png',
+    shell:
+        'python -m pool_simulation.plot_ari_grid --ari {input} --output {output}'

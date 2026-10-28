@@ -1,0 +1,18 @@
+# Configuration of the pool simulation workflow (workflow/pool_simulation/Snakefile).
+
+# Depth matrix exported with `pool_simulation.export_depth` (see README).
+depth_source: 'results/depth.csv.gz'
+
+# DemoTape script used for demultiplexing (pandas < 3, see README).
+demotape_script: '/cluster/work/bewi/members/jgawron/INTeRCePT/mincedTapestri/workflow/scripts/demultiplex_distance.py'
+
+output_directory: 'results/pool_grid'
+
+# Simulation grid: number of sites where pat1 and pat2 have the same genotype
+# (n_same) and different genotypes (n_diff), and the number of pools (seeds
+# 0, ..., seeds - 1) per combination. Cell numbers and doublet rate are drawn
+# per pool (see simulate_pool.py), independently across the grid: the simulator
+# combines the seed with n_same and n_diff.
+n_same: [1, 2, 5, 10]
+n_diff: [1, 2, 5, 10]
+seeds: 10

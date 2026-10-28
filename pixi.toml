@@ -144,6 +144,11 @@ workflow-dry = "snakemake -n --profile workflow/profiles --snakefile workflow/Sn
 # Run Snakemake workflow, submitting rules as SLURM jobs
 workflow = "snakemake --executor slurm --jobs 300 --profile workflow/profiles --printshellcmds --snakefile workflow/Snakefile" # --config workflow/config/params.yaml
 
+# Pool simulation workflow: simulate pools over the n_same x n_diff grid,
+# demultiplex with DemoTape, compute ARIs and plot them
+pool-grid-dry = "snakemake -n --profile workflow/profiles --snakefile workflow/pool_simulation/Snakefile"
+pool-grid = "snakemake --jobs 300 --profile workflow/profiles --printshellcmds --snakefile workflow/pool_simulation/Snakefile"
+
 
 # Clean generated files
 clean = "rm -rf results/*.parquet docs/*.html .pytest_cache .mypy_cache .ruff_cache"

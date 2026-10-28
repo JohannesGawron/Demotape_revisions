@@ -101,7 +101,7 @@ pixi run python -m pool_simulation.simulate_pool \
 | `--cells_per_sample` | Number of singlets for pat0, pat1 and pat2; unequal numbers give unbalanced mixing. If omitted, drawn uniformly from 500–3000 per sample |
 | `--doublet_rate` | Fraction of all cells that are doublets, added on top of the singlets. If omitted, drawn uniformly from 0.05–0.3 per run |
 | `--depth_source` | Depth matrix from step 1 (required) |
-| `--seed` | Random seed; the same seed and options reproduce the same pool, including drawn cell numbers and doublet rate |
+| `--seed` | Random seed; the same seed and options reproduce the same pool, including drawn cell numbers and doublet rate. The seed is combined with `--n_same` and `--n_diff`, so the same seed gives independent pools (other cell numbers, doublet rate, genotypes, reads) for different site numbers |
 | `--output` | Output CSV file (required) |
 
 For a grid over the number of shared (x) and distinguishing (y) sites, with
@@ -132,25 +132,51 @@ output format below) and needs pandas < 3, which `pixi.toml` pins.
 
 When I set the flag `--output_plot`, the demultiplexing script `demultiplex_distance.py` (commit #93ec5c4) crashed. 
 
-**Local fix in DemoTape (not committed in the mincedTapestri repository):**
-with ground-truth labels in the cell names, `--output_plot` crashed in
-`plot_heatmap` (`TypeError: '<=' not supported between instances of 'int' and
-'list'`), because line 410 nested the row colours one level too deep for
-seaborn's `clustermap`. The line was changed from
+**Local fixes in DemoTape (not committed in the mincedTapestri repository).**
+Two lines of `workflow/scripts/demultiplex_distance.py` were changed:
 
-```python
-r_colors = [get_row_cols(self.true_cl), get_row_cols(assignment_str)]
-```
+1. **Crash on low-information pools (line 131, `init_dendrogram`).** Pools with
+   very few informative sites (e.g. `n_same = 1`, `n_diff = 1`) crashed in
+   `cut_tree` (`ValueError: Linkage 'Z' contains excessive observations in a
+   cluster`; older SciPy: `... uses the same cluster more than once`). Two
+   problems in the same line:
+   - Some cell-to-cell distances are slightly negative (about −1e-16, floating
+     point rounding). Ward linkage on them gives an invalid tree with NaN
+     entries. The original line clipped only the tree (the output of `linkage`)
+     at 0, which cannot repair it; now the distances (the input) are clipped.
+   - Distances between cells without a shared covered informative site are NaN
+     (0 / 0). `np.nan_to_num(dist, 0.5)` passed 0.5 as `copy`, not as the fill
+     value, so these NaNs became 0 ("identical cells"), in every numpy version.
+     Now `nan=0.5` replaces them with 0.5, as presumably intended.
 
-to
+   ```python
+   # before
+   self.Z = np.clip(linkage(np.nan_to_num(dist, 0.5), method='ward'), 0, None)
+   # after
+   self.Z = linkage(np.clip(np.nan_to_num(dist, nan=0.5), 0, None), method='ward')
+   ```
 
-```python
-r_colors = [*get_row_cols(self.true_cl), *get_row_cols(assignment_str)]
-```
+   The clipping alone leaves the cluster assignments of pools that worked before
+   unchanged (only the leaf order of the tree can differ). The NaN fill value
+   only matters for pools with cell pairs that share no covered site, i.e.
+   pools with very few informative sites.
 
-The heatmap now shows four colour columns (true cluster, true doublet partner,
-assigned cluster, assigned doublet partner). Only the plot is affected; the
-assignments and profiles are unchanged.
+2. **Crash of `--output_plot` with ground-truth labels (line 410,
+   `plot_heatmap`).** With ground-truth labels in the cell names, the plot
+   crashed (`TypeError: '<=' not supported between instances of 'int' and
+   'list'`), because the row colours were nested one level too deep for
+   seaborn's `clustermap`:
+
+   ```python
+   # before
+   r_colors = [get_row_cols(self.true_cl), get_row_cols(assignment_str)]
+   # after
+   r_colors = [*get_row_cols(self.true_cl), *get_row_cols(assignment_str)]
+   ```
+
+   The heatmap now shows four colour columns (true cluster, true doublet
+   partner, assigned cluster, assigned doublet partner). Only the plot is
+   affected.
 
 **4. Evaluate the demultiplexing.** `evaluate_demultiplexing.py` computes the
 adjusted Rand index (ARI) between the true patient and DemoTape's assigned
@@ -164,6 +190,27 @@ file (`file`, `n_cells`, `ari_pat1_pat2`).
 pixi run python -m pool_simulation.evaluate_demultiplexing \
     --assignments results/pool_same50_diff20_seed0_demultiplexed.assignments.tsv \
     --output results/ari.tsv
+```
+
+**Benchmark workflow (steps 2–4 over a grid).** `workflow/pool_simulation/`
+is a separate Snakemake workflow that runs steps 2–4 for every combination of
+`n_same` and `n_diff` in 1, 2, 5 and 10, with 10 pools (seeds 0–9) each, so
+160 pools. Cell numbers and doublet rates are drawn per pool (the defaults of
+`simulate_pool.py`), independently across the grid (see `--seed`). The depth
+matrix `results/depth.csv.gz` from step 1 is
+reused. The grid, number of seeds and paths are set in
+`workflow/pool_simulation/config.yaml`. The workflow writes:
+
+- `results/pool_grid/pools/same<n_same>_diff<n_diff>_seed<seed>.csv`: the pools,
+- `results/pool_grid/demultiplexed/...`: DemoTape's assignments and profiles,
+- `results/pool_grid/ari.tsv`: the ARI of every pool, and
+- `results/pool_grid/ari_grid.png`: a grid of boxplots of the ARI over the seeds
+  (rows: `n_same`, columns: `n_diff`; `plot_ari_grid.py`, styled like
+  INSCITE-py's plots).
+
+```bash
+pixi run pool-grid-dry   # dry run: show what would be executed
+pixi run pool-grid       # submit rules as SLURM jobs (profile in workflow/profiles/)
 ```
 
 ### Output format
@@ -225,12 +272,15 @@ envs/
 src/pool_simulation/
 ├── export_depth.py          # Export real libraries as one anonymised depth matrix (CLI)
 ├── simulate_pool.py         # Simulate a 3-patient pool in DemoTape input format (CLI)
-└── evaluate_demultiplexing.py  # ARI of pat1 vs. pat2 in DemoTape's assignments (CLI)
+├── evaluate_demultiplexing.py  # ARI of pat1 vs. pat2 in DemoTape's assignments (CLI)
+└── plot_ari_grid.py         # Grid of ARI boxplots over n_same x n_diff (CLI)
 
 workflow/
 ├── Snakefile                # Pipeline definition
 ├── config/params.yaml       # Input/output paths, mosaic filtering thresholds
 ├── config/subsample_lookup_table.tsv  # Generated: one row per subsample
+├── pool_simulation/Snakefile  # Pool simulation benchmark: simulate, demultiplex, ARI, plot
+├── pool_simulation/config.yaml  # Its grid (n_same, n_diff, seeds) and paths
 └── profiles/config.yaml     # SLURM executor profile (account, retries, defaults)
 
 notebooks/

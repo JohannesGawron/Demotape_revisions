@@ -108,8 +108,8 @@ For a grid over the number of shared (x) and distinguishing (y) sites, with
 several repetitions each:
 
 ```bash
-for x in 0 10 20 50; do
-  for y in 5 10 20 50; do
+for x in 1 2 5 10; do
+  for y in 1 2 5 10; do
     for seed in 0 1 2 3 4 5 6 7 8 9; do
       pixi run python -m pool_simulation.simulate_pool \
           --n_same $x --n_diff $y --depth_source results/depth.csv.gz \
